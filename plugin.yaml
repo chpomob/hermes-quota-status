@@ -1,0 +1,6 @@
+name: hermes-quota-status
+version: "1.0.0"
+description: "Display Claude Code and Codex CLI quota usage in the Hermes status bar"
+author: "Hermes Agent"
+provides_hooks:
+  - on_status_bar_render

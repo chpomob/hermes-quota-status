@@ -1,0 +1,73 @@
+{
+  "phase": "verify",
+  "exit_code": 0,
+  "results": [
+    {
+      "id": "S1",
+      "status": "resolved",
+      "note": "R14 now defines trigger as terminal width \u2264 60 columns; AC30 covers the opposite case."
+    },
+    {
+      "id": "S2",
+      "status": "resolved",
+      "note": "R17 now explicitly requires suppressed providers to continue background quota checks; AC32 confirms refresh attempts during suppression."
+    },
+    {
+      "id": "S3",
+      "status": "resolved",
+      "note": "R2 now establishes GLM_API_KEY priority with ZHIPU_API_KEY as fallback; AC25 confirms priority when both are set."
+    },
+    {
+      "id": "S4",
+      "status": "resolved",
+      "note": "AC16 now specifies rendering as relative countdown '0h0m'."
+    },
+    {
+      "id": "S5",
+      "status": "resolved",
+      "note": "R18 replaced vague 'preserve' language with concrete semantics (one segment, v2 short code, available quota values); AC22 specifies exact segment count and window inclusion."
+    },
+    {
+      "id": "S6",
+      "status": "resolved",
+      "note": "R15 now scoped to current plugin process, non-auth failures explicitly excluded from counter; AC31 details counter lifecycle."
+    },
+    {
+      "id": "S7",
+      "status": "resolved",
+      "note": "R20 now requires at least one passing test per requirement id; AC24 enumerates specific test areas."
+    },
+    {
+      "id": "S8",
+      "status": "resolved",
+      "note": "Problem wording changed from 'currently reports' to 'is expected to report', removing the claim of existing code."
+    },
+    {
+      "id": "S9",
+      "status": "resolved",
+      "note": "R9/R10 now explicitly describe single-window fallback; AC27/AC28 cover single-window rendering without placeholders."
+    },
+    {
+      "id": "S10",
+      "status": "resolved",
+      "note": "R3 now specifies api.z.ai first with open.bigmodel.cn fallback; AC4 and AC26 cover primary and fallback."
+    },
+    {
+      "id": "S11",
+      "status": "resolved",
+      "note": "R11 now enumerates all five case-sensitive provider names; AC29 confirms case-sensitive matching."
+    },
+    {
+      "id": "S12",
+      "status": "resolved",
+      "note": "Problem section now explicitly documents the Gemini G\u2192Ge rename and G reservation for GLM."
+    },
+    {
+      "id": "S13",
+      "status": "rejected",
+      "note": "Targets section is metadata, not requirements. Bundling rendering concerns in one renderer file is a reasonable implementation choice, not a spec defect."
+    }
+  ],
+  "verdict": "APPROVE",
+  "stdout": "```json\n{\n  \"results\": [\n    {\n      \"id\": \"S1\",\n      \"status\": \"resolved\",\n      \"note\": \"R14 now defines trigger as terminal width \u2264 60 columns; AC30 covers the opposite case.\"\n    },\n    {\n      \"id\": \"S2\",\n      \"status\": \"resolved\",\n      \"note\": \"R17 now explicitly requires suppressed providers to continue background quota checks; AC32 confirms refresh attempts during suppression.\"\n    },\n    {\n      \"id\": \"S3\",\n      \"status\": \"resolved\",\n      \"note\": \"R2 now establishes GLM_API_KEY priority with ZHIPU_API_KEY as fallback; AC25 confirms priority when both are set.\"\n    },\n    {\n      \"id\": \"S4\",\n      \"status\": \"resolved\",\n      \"note\": \"AC16 now specifies rendering as relative countdown '0h0m'.\"\n    },\n    {\n      \"id\": \"S5\",\n      \"status\": \"resolved\",\n      \"note\": \"R18 replaced vague 'preserve' language with concrete semantics (one segment, v2 short code, available quota values); AC22 specifies exact segment count and window inclusion.\"\n    },\n    {\n      \"id\": \"S6\",\n      \"status\": \"resolved\",\n      \"note\": \"R15 now scoped to current plugin process, non-auth failures explicitly excluded from counter; AC31 details counter lifecycle.\"\n    },\n    {\n      \"id\": \"S7\",\n      \"status\": \"resolved\",\n      \"note\": \"R20 now requires at least one passing test per requirement id; AC24 enumerates specific test areas.\"\n    },\n    {\n      \"id\": \"S8\",\n      \"status\": \"resolved\",\n      \"note\": \"Problem wording changed from 'currently reports' to 'is expected to report', removing the claim of existing code.\"\n    },\n    {\n      \"id\": \"S9\",\n      \"status\": \"resolved\",\n      \"note\": \"R9/R10 now explicitly describe single-window fallback; AC27/AC28 cover single-window rendering without placeholders.\"\n    },\n    {\n      \"id\": \"S10\",\n      \"status\": \"resolved\",\n      \"note\": \"R3 now specifies api.z.ai first with open.bigmodel.cn fallback; AC4 and AC26 cover primary and fallback.\"\n    },\n    {\n      \"id\": \"S11\",\n      \"status\": \"resolved\",\n      \"note\": \"R11 now enumerates all five case-sensitive provider names; AC29 confirms case-sensitive matching.\"\n    },\n    {\n      \"id\": \"S12\",\n      \"status\": \"resolved\",\n      \"note\": \"Problem section now explicitly documents the Gemini G\u2192Ge rename and G reservation for GLM.\"\n    },\n    {\n      \"id\": \"S13\",\n      \"status\": \"rejected\",\n      \"note\": \"Targets section is metadata, not requirements. Bundling rendering concerns in one renderer file is a reasonable implementation choice, not a spec defect.\"\n    }\n  ],\n  \"verdict\": \"APPROVE\"\n}\n```"
+}

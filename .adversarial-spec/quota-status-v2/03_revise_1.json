@@ -1,0 +1,6 @@
+{
+  "phase": "revise",
+  "exit_code": 0,
+  "commit_sha": "f600890a0815d9964ca35f358068d924f9dc50ea",
+  "stdout": "Updated `spec.md` on disk and verified requirement/acceptance-criteria coverage plus diff cleanliness."
+}
