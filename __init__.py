@@ -60,7 +60,7 @@ PROVIDER_SHORT: Final[dict[ProviderName, str]] = {
     "claude": "C",
     "codex": "Cx",
     "gemini": "Ge",
-    "glm": "GL",
+    "glm": "G",
     "deepseek": "D",
 }
 THRESHOLD_WARN: Final[float] = 50.0
@@ -708,6 +708,8 @@ def _render_provider(provider: ProviderName, data: ProviderQuota | None, is_stal
     short = PROVIDER_SHORT[provider]
     if data is None or is_stale:
         return f"🔴 {short}:?"
+    if data.get("session_pct") is None:
+        return f"🟡 {short}:?"
 
     pct = _quota_pct(data.get("session_pct"))
     reset = _fmt_reset(data.get("reset_iso", ""))

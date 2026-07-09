@@ -1,4 +1,4 @@
-"""Shared quota API client for Claude, Codex, and Gemini."""
+"""Shared quota API client for Claude, Codex, Gemini, and GLM."""
 from __future__ import annotations
 
 import json
@@ -15,6 +15,66 @@ MAX_RESPONSE_BYTES = 1_048_576
 HTTP_TIMEOUT = 8
 GEMINI_PROBE_TIMEOUT = 5
 MAX_RESET_EPOCH = 32_503_680_000.0  # 3000-01-01T00:00:00Z
+GLM_QUOTA_PATH = "/api/monitor/usage/quota/limit"
+GLM_QUOTA_HOSTS = ("https://api.z.ai", "https://open.bigmodel.cn")
+GLM_AVAILABLE_PCT_FIELDS = (
+    "availableLimitPercentage",
+    "available_limit_percentage",
+    "availableLimitPercent",
+    "available_limit_percent",
+    "availablePercentage",
+    "available_percentage",
+    "availablePercent",
+    "remainingPercentage",
+    "remaining_percent",
+)
+GLM_USED_PCT_FIELDS = (
+    "percentage",
+    "usedPercentage",
+    "used_percentage",
+    "usedPercent",
+    "used_percent",
+    "usagePercentage",
+    "usage_percentage",
+    "usagePercent",
+    "usage_percent",
+    "utilization",
+)
+GLM_REMAINING_FRACTION_FIELDS = (
+    "remainingFraction",
+    "remaining_fraction",
+    "availableFraction",
+    "available_fraction",
+)
+GLM_BALANCE_FIELDS = (
+    "balance",
+    "remainingBalance",
+    "remaining_balance",
+    "availableBalance",
+    "available_balance",
+    "credits",
+    "credit",
+)
+GLM_RESET_FIELDS = (
+    "nextResetTime",
+    "next_reset_time",
+    "resetTime",
+    "reset_time",
+    "resetAt",
+    "reset_at",
+    "resetsAt",
+    "resets_at",
+    "periodEnd",
+    "period_end",
+    "endTime",
+    "end_time",
+)
+GLM_QUOTA_VALUE_FIELDS = (
+    *GLM_AVAILABLE_PCT_FIELDS,
+    *GLM_USED_PCT_FIELDS,
+    *GLM_REMAINING_FRACTION_FIELDS,
+    *GLM_BALANCE_FIELDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +134,13 @@ def get_gemini_key() -> str | None:
     return None
 
 
+def get_glm_key() -> str | None:
+    key = _non_empty_str(os.environ.get("GLM_API_KEY"))
+    if key:
+        return key
+    return _non_empty_str(os.environ.get("ZHIPU_API_KEY"))
+
+
 def fetch_json(req: urllib.request.Request) -> dict[str, Any]:
     ctx = ssl.create_default_context()
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as resp:
@@ -92,27 +159,151 @@ def json_object(value: Any) -> dict[str, Any]:
 
 
 def json_number(value: Any) -> float:
+    number = json_number_or_none(value)
+    return 0.0 if number is None else number
+
+
+def json_number_or_none(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
-        return 0.0
+        return None
     if isinstance(value, int | float):
         return float(value)
     if isinstance(value, str):
         try:
             return float(value)
         except ValueError:
-            return 0.0
-    return 0.0
+            return None
+    return None
 
 
 def _clamp_pct(value: Any) -> float:
     return max(0.0, min(json_number(value), 100.0))
 
 
+def _clamp_fraction(value: Any) -> float | None:
+    number = json_number_or_none(value)
+    if number is None:
+        return None
+    return max(0.0, min(number, 1.0))
+
+
+def _percent_or_none(value: Any) -> float | None:
+    number = json_number_or_none(value)
+    if number is None:
+        return None
+    return max(0.0, min(number, 100.0))
+
+
 def _epoch_to_iso(epoch_seconds: Any) -> str:
-    reset_at = json_number(epoch_seconds)
+    reset_at = json_number_or_none(epoch_seconds)
+    if reset_at is None:
+        return ""
+    if reset_at > MAX_RESET_EPOCH and 0.0 < reset_at / 1000.0 <= MAX_RESET_EPOCH:
+        reset_at = reset_at / 1000.0
     if 0.0 < reset_at <= MAX_RESET_EPOCH:
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset_at))
     return ""
+
+
+def _normalize_key(key: str) -> str:
+    return "".join(ch for ch in key.lower() if ch.isalnum())
+
+
+def _walk_json(value: Any) -> list[dict[str, Any]]:
+    pending = [value]
+    objects: list[dict[str, Any]] = []
+    while pending:
+        current = pending.pop(0)
+        if isinstance(current, dict):
+            objects.append(current)
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return objects
+
+
+def _find_direct_value(data: dict[str, Any], names: tuple[str, ...]) -> Any:
+    wanted = {_normalize_key(name) for name in names}
+    for key, value in data.items():
+        if isinstance(key, str) and _normalize_key(key) in wanted:
+            return value
+    return None
+
+
+def _has_direct_field(data: dict[str, Any], names: tuple[str, ...]) -> bool:
+    wanted = {_normalize_key(name) for name in names}
+    return any(isinstance(key, str) and _normalize_key(key) in wanted for key in data)
+
+
+def _glm_quota_object_rank(data: dict[str, Any]) -> tuple[int, int] | None:
+    if not _has_direct_field(data, GLM_QUOTA_VALUE_FIELDS):
+        return None
+
+    limit_type = data.get("type")
+    is_token_limit = isinstance(limit_type, str) and limit_type.upper() == "TOKENS_LIMIT"
+    is_non_token_limit = isinstance(limit_type, str) and limit_type.upper() != "TOKENS_LIMIT"
+    unit = json_number_or_none(data.get("unit"))
+
+    if is_token_limit and unit == 3:
+        return (0, 0)
+    if is_token_limit and unit == 6:
+        return (1, 0)
+    if is_token_limit:
+        return (2, 0)
+    if is_non_token_limit:
+        return (4, 0)
+    return (3, 0)
+
+
+def _select_glm_quota_object(data: dict[str, Any]) -> dict[str, Any]:
+    ranked: list[tuple[tuple[int, int], dict[str, Any]]] = []
+    for index, obj in enumerate(_walk_json(data)):
+        rank = _glm_quota_object_rank(obj)
+        if rank is not None:
+            ranked.append(((rank[0], index), obj))
+    if not ranked:
+        raise ValueError("GLM quota response did not include quota fields")
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
+
+
+def _string_or_epoch_iso(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return _epoch_to_iso(value)
+
+
+def _normalize_glm_quota(data: dict[str, Any], host: str) -> dict[str, Any]:
+    quota = _select_glm_quota_object(data)
+    available_pct = _percent_or_none(_find_direct_value(quota, GLM_AVAILABLE_PCT_FIELDS))
+    used_pct = _percent_or_none(_find_direct_value(quota, GLM_USED_PCT_FIELDS))
+    remaining_fraction = _clamp_fraction(_find_direct_value(quota, GLM_REMAINING_FRACTION_FIELDS))
+    balance = json_number_or_none(_find_direct_value(quota, GLM_BALANCE_FIELDS))
+    reset = _string_or_epoch_iso(_find_direct_value(quota, GLM_RESET_FIELDS))
+
+    if available_pct is None and used_pct is None and remaining_fraction is None and balance is None:
+        raise ValueError("GLM quota response did not include quota fields")
+
+    if used_pct is None:
+        if available_pct is not None:
+            used_pct = 100.0 - available_pct
+        elif remaining_fraction is not None:
+            used_pct = 100.0 - (remaining_fraction * 100.0)
+
+    result: dict[str, Any] = {
+        "host": host,
+        "session_reset": reset,
+        "reset_iso": reset,
+    }
+    if used_pct is not None:
+        result["session_pct"] = _clamp_pct(used_pct)
+    if available_pct is not None:
+        result["available_limit_pct"] = available_pct
+    if remaining_fraction is not None:
+        result["remaining_fraction"] = remaining_fraction
+    if balance is not None:
+        result["balance"] = balance
+    return result
 
 
 def fetch_claude_quota() -> dict[str, Any] | None:
@@ -225,6 +416,29 @@ def fetch_gemini_quota() -> dict[str, Any] | None:
     }
 
 
+def fetch_glm_quota() -> dict[str, Any] | None:
+    key = get_glm_key()
+    if not key:
+        return None
+
+    last_error: Exception | None = None
+    for host in GLM_QUOTA_HOSTS:
+        req = urllib.request.Request(
+            f"{host}{GLM_QUOTA_PATH}",
+            headers={"Authorization": key},
+        )
+        try:
+            return _normalize_glm_quota(fetch_json(req), host)
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+        except (OSError, TimeoutError, ValueError) as exc:
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+    return None
+
+
 def fetch_all_quotas() -> dict[str, dict[str, Any] | None]:
     """Fetch all providers with per-provider error isolation."""
     result: dict[str, dict[str, Any] | None] = {}
@@ -232,6 +446,7 @@ def fetch_all_quotas() -> dict[str, dict[str, Any] | None]:
         ("claude", fetch_claude_quota),
         ("codex", fetch_codex_quota),
         ("gemini", fetch_gemini_quota),
+        ("glm", fetch_glm_quota),
     ):
         try:
             result[name] = fetcher()

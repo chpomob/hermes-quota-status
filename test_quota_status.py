@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 PLUGIN_PATH = Path(__file__).with_name("__init__.py")
 CLOUDCODE_PATH = Path(__file__).with_name("gemini_cloudcode.py")
+QUOTA_API_PATH = Path(__file__).with_name("quota_api.py")
 
 
 def load_plugin() -> ModuleType:
@@ -33,6 +34,220 @@ def load_cloudcode() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_quota_api() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("quota_api_test", QUOTA_API_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load quota API module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class QuotaApiGlmTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.quota_api = load_quota_api()
+
+    def test_fetch_glm_quota_missing_credentials_returns_none(self) -> None:
+        with patch.dict(self.quota_api.os.environ, {}, clear=True), patch.object(
+            self.quota_api, "fetch_json"
+        ) as fetch_json:
+            self.assertIsNone(self.quota_api.fetch_glm_quota())
+
+        fetch_json.assert_not_called()
+
+    def test_fetch_glm_quota_success_normalizes_quota_shape(self) -> None:
+        requests = []
+
+        def fake_fetch(req):
+            requests.append(req)
+            return {
+                "data": {
+                    "availableLimitPercentage": "72",
+                    "remainingFraction": "0.72",
+                    "balance": "18.5",
+                    "resetTime": "2026-07-10T00:00:00Z",
+                }
+            }
+
+        with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "glm-raw"}, clear=True), patch.object(
+            self.quota_api, "fetch_json", side_effect=fake_fetch
+        ):
+            result = self.quota_api.fetch_glm_quota()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(requests[0].full_url, "https://api.z.ai/api/monitor/usage/quota/limit")
+        self.assertEqual(requests[0].get_header("Authorization"), "glm-raw")
+        self.assertEqual(result["host"], "https://api.z.ai")
+        self.assertEqual(result["available_limit_pct"], 72.0)
+        self.assertEqual(result["remaining_fraction"], 0.72)
+        self.assertEqual(result["balance"], 18.5)
+        self.assertEqual(result["session_pct"], 28.0)
+        self.assertEqual(result["session_reset"], "2026-07-10T00:00:00Z")
+        self.assertEqual(result["reset_iso"], "2026-07-10T00:00:00Z")
+
+    def test_get_glm_key_prefers_glm_api_key_over_zhipu_api_key(self) -> None:
+        with patch.dict(
+            self.quota_api.os.environ,
+            {"GLM_API_KEY": "glm-raw", "ZHIPU_API_KEY": "zhipu-raw"},
+            clear=True,
+        ):
+            self.assertEqual(self.quota_api.get_glm_key(), "glm-raw")
+
+    def test_get_glm_key_falls_back_to_zhipu_when_glm_empty_or_unset(self) -> None:
+        cases = (
+            {"ZHIPU_API_KEY": "zhipu-raw"},
+            {"GLM_API_KEY": "", "ZHIPU_API_KEY": "zhipu-raw"},
+        )
+        for env in cases:
+            with self.subTest(env=env), patch.dict(self.quota_api.os.environ, env, clear=True):
+                self.assertEqual(self.quota_api.get_glm_key(), "zhipu-raw")
+
+    def test_fetch_glm_quota_uses_raw_non_bearer_authorization(self) -> None:
+        requests = []
+
+        def fake_fetch(req):
+            requests.append(req)
+            return {"data": {"availableLimitPercentage": 100}}
+
+        with patch.dict(self.quota_api.os.environ, {"ZHIPU_API_KEY": "raw-zhipu-key"}, clear=True), patch.object(
+            self.quota_api, "fetch_json", side_effect=fake_fetch
+        ):
+            self.quota_api.fetch_glm_quota()
+
+        self.assertEqual(requests[0].get_header("Authorization"), "raw-zhipu-key")
+        self.assertNotIn("Bearer", requests[0].get_header("Authorization"))
+
+    def test_fetch_glm_quota_falls_back_to_open_bigmodel_after_primary_failure(self) -> None:
+        urls = []
+
+        def fake_fetch(req):
+            urls.append(req.full_url)
+            if len(urls) == 1:
+                raise urllib.error.URLError("primary unavailable")
+            return {"data": {"availableLimitPercentage": 64}}
+
+        with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "glm-raw"}, clear=True), patch.object(
+            self.quota_api, "fetch_json", side_effect=fake_fetch
+        ):
+            result = self.quota_api.fetch_glm_quota()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            urls,
+            [
+                "https://api.z.ai/api/monitor/usage/quota/limit",
+                "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+            ],
+        )
+        self.assertEqual(result["host"], "https://open.bigmodel.cn")
+        self.assertEqual(result["session_pct"], 36.0)
+
+    def test_fetch_glm_quota_falls_back_after_primary_auth_error(self) -> None:
+        urls = []
+        auth_error = urllib.error.HTTPError(
+            "https://api.z.ai/api/monitor/usage/quota/limit",
+            401,
+            "unauthorized",
+            {},
+            None,
+        )
+
+        def fake_fetch(req):
+            urls.append(req.full_url)
+            if len(urls) == 1:
+                raise auth_error
+            return {"data": {"availableLimitPercentage": 91}}
+
+        with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "mainland-key"}, clear=True), patch.object(
+            self.quota_api, "fetch_json", side_effect=fake_fetch
+        ):
+            result = self.quota_api.fetch_glm_quota()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            urls,
+            [
+                "https://api.z.ai/api/monitor/usage/quota/limit",
+                "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+            ],
+        )
+        self.assertEqual(result["host"], "https://open.bigmodel.cn")
+        self.assertEqual(result["session_pct"], 9.0)
+
+    def test_fetch_glm_quota_raises_auth_error_after_all_hosts_fail_auth(self) -> None:
+        urls = []
+
+        def fake_fetch(req):
+            urls.append(req.full_url)
+            raise urllib.error.HTTPError(req.full_url, 401, "unauthorized", {}, None)
+
+        with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "bad-key"}, clear=True), patch.object(
+            self.quota_api, "fetch_json", side_effect=fake_fetch
+        ):
+            with self.assertRaises(urllib.error.HTTPError):
+                self.quota_api.fetch_glm_quota()
+
+        self.assertEqual(
+            urls,
+            [
+                "https://api.z.ai/api/monitor/usage/quota/limit",
+                "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+            ],
+        )
+
+    def test_fetch_glm_quota_supports_bigmodel_limit_shape(self) -> None:
+        with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "glm-raw"}, clear=True), patch.object(
+            self.quota_api,
+            "fetch_json",
+            return_value={
+                "data": {
+                    "limits": [
+                        {"type": "TIME_LIMIT", "unit": 5, "percentage": 0, "nextResetTime": 1780336384978},
+                        {"type": "TOKENS_LIMIT", "unit": 3, "percentage": 16, "nextResetTime": 1777819631597},
+                        {"type": "TOKENS_LIMIT", "unit": 6, "percentage": 4, "nextResetTime": 1778262784969},
+                    ]
+                }
+            },
+        ):
+            result = self.quota_api.fetch_glm_quota()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["session_pct"], 16.0)
+        self.assertEqual(result["session_reset"], "2026-05-03T14:47:11Z")
+        self.assertEqual(result["reset_iso"], "2026-05-03T14:47:11Z")
+
+    def test_fetch_glm_quota_balance_only_leaves_percentage_unknown(self) -> None:
+        with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "glm-raw"}, clear=True), patch.object(
+            self.quota_api,
+            "fetch_json",
+            return_value={"data": {"balance": 0.01}},
+        ):
+            result = self.quota_api.fetch_glm_quota()
+
+        self.assertIsNotNone(result)
+        self.assertNotIn("session_pct", result)
+        self.assertEqual(result["balance"], 0.01)
+
+    def test_render_glm_uses_quota_data_from_fallback_host(self) -> None:
+        plugin = load_plugin()
+        calls = []
+
+        def fake_fetch(req):
+            calls.append(req.full_url)
+            if len(calls) == 1:
+                return {"error": "malformed primary response"}
+            return {"data": {"availableLimitPercentage": 91}}
+
+        with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "glm-raw"}, clear=True), patch.object(
+            self.quota_api, "fetch_json", side_effect=fake_fetch
+        ):
+            result = self.quota_api.fetch_glm_quota()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["host"], "https://open.bigmodel.cn")
+        self.assertEqual(plugin._render_provider("glm", result, False), "🟢 G:9%")
 
 
 class HermesQuotaStatusTests(unittest.TestCase):
@@ -307,7 +522,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
         self.assertEqual(self.plugin.PROVIDERS, expected)
         self.assertEqual(tuple(self.plugin._PROVIDERS), active_fetchers)
         self.assertEqual(self.plugin.PROVIDER_SHORT["gemini"], "Ge")
-        self.assertEqual(self.plugin.PROVIDER_SHORT["glm"], "GL")
+        self.assertEqual(self.plugin.PROVIDER_SHORT["glm"], "G")
         self.assertEqual(self.plugin.PROVIDER_SHORT["deepseek"], "D")
         for provider in expected:
             self.assertIn(provider, self.plugin._cache)
