@@ -17,7 +17,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, cast
@@ -64,6 +64,13 @@ ProviderName: TypeAlias = Literal["claude", "codex", "gemini", "glm", "deepseek"
 QuotaWindowKey: TypeAlias = Literal["session", "weekly"]
 
 PROVIDERS: Final[tuple[ProviderName, ...]] = ("claude", "codex", "gemini", "glm", "deepseek")
+CONFIG_CONTAINER_KEYS: Final[tuple[str, ...]] = (
+    "config",
+    "config_snapshot",
+    "snapshot",
+    "context",
+    "render_context",
+)
 PROVIDER_SHORT: Final[dict[ProviderName, str]] = {
     "claude": "C",
     "codex": "Cx",
@@ -622,15 +629,19 @@ def _retry_ttl(error_type: str) -> int:
     return AUTH_RETRY_TTL if error_type in {"auth", "missing_token"} else ERROR_RETRY_TTL
 
 
-def _due_providers(now: float) -> tuple[ProviderName, ...]:
-    return tuple(provider for provider in _PROVIDERS if now >= _cache["next_retry"].get(provider, 0.0))
+def _due_providers(now: float, providers: tuple[ProviderName, ...] = PROVIDERS) -> tuple[ProviderName, ...]:
+    return tuple(
+        provider
+        for provider in providers
+        if provider in _PROVIDERS and now >= _cache["next_retry"].get(provider, 0.0)
+    )
 
 
-def _claim_refresh(now: float) -> tuple[ProviderName, ...]:
+def _claim_refresh(now: float, providers: tuple[ProviderName, ...] = PROVIDERS) -> tuple[ProviderName, ...]:
     with _cache_lock:
         if _cache["refreshing"]:
             return ()
-        due = _due_providers(now)
+        due = _due_providers(now, providers)
         if due:
             _cache["refreshing"] = True
         return due
@@ -701,8 +712,8 @@ def _refresh_cache(due_providers: tuple[ProviderName, ...] | None = None) -> Non
             _cache["refreshing"] = False
 
 
-def _start_refresh_if_needed() -> None:
-    due_providers = _claim_refresh(time.time())
+def _start_refresh_if_needed(providers: tuple[ProviderName, ...]) -> None:
+    due_providers = _claim_refresh(time.time(), providers)
     if not due_providers:
         return
 
@@ -991,21 +1002,101 @@ def _render_provider(provider: ProviderName, data: ProviderQuota | None, is_stal
     return f"🟢 {short}:{rendered_windows}"
 
 
+def _source_value(source: Any, key: str) -> Any:
+    if isinstance(source, Mapping):
+        return source.get(key)
+    return getattr(source, key, None)
+
+
+def _normalize_provider_allowlist(raw_providers: Any) -> tuple[ProviderName, ...] | None:
+    if raw_providers is None or isinstance(raw_providers, str | bytes | bytearray) or isinstance(raw_providers, Mapping):
+        return None
+    if not isinstance(raw_providers, Iterable) or isinstance(raw_providers, Iterator):
+        return None
+
+    configured: list[ProviderName] = []
+    invalid_names: list[str] = []
+    seen: set[ProviderName] = set()
+    for provider in raw_providers:
+        if not isinstance(provider, str):
+            continue
+        if provider not in PROVIDERS:
+            invalid_names.append(provider)
+            continue
+        provider_name = cast(ProviderName, provider)
+        if provider_name in seen:
+            continue
+        configured.append(provider_name)
+        seen.add(provider_name)
+
+    if invalid_names:
+        logger.warning(
+            "ignored unknown quota_status.providers entries",
+            extra={"quota_status_unknown_providers": invalid_names},
+        )
+    return tuple(configured)
+
+
+def _provider_allowlist_from_quota_status(quota_status: Any) -> tuple[ProviderName, ...] | None:
+    if quota_status is None:
+        return None
+    return _normalize_provider_allowlist(_source_value(quota_status, "providers"))
+
+
+def _provider_allowlist_from_config_source(
+    source: Any,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> tuple[ProviderName, ...] | None:
+    if source is None or depth > 4:
+        return None
+    if seen is None:
+        seen = set()
+    source_id = id(source)
+    if source_id in seen:
+        return None
+    seen.add(source_id)
+
+    allowlist = _provider_allowlist_from_quota_status(_source_value(source, "quota_status"))
+    if allowlist is not None:
+        return allowlist
+
+    for key in CONFIG_CONTAINER_KEYS:
+        nested = _source_value(source, key)
+        allowlist = _provider_allowlist_from_config_source(nested, depth=depth + 1, seen=seen)
+        if allowlist is not None:
+            return allowlist
+    return None
+
+
+def _provider_allowlist_from_render_args(snapshot: Any, kwargs: Mapping[str, Any]) -> tuple[ProviderName, ...] | None:
+    allowlist = _provider_allowlist_from_config_source(snapshot)
+    if allowlist is not None:
+        return allowlist
+    return _provider_allowlist_from_config_source(kwargs)
+
+
 def on_status_bar_render(snapshot=None, **kwargs) -> str | None:
     """Hook: return a string for the status bar, or None to not contribute.
     
     Accepts **kwargs to stay forward-compatible (e.g. telemetry_schema_version).
     """
     try:
-        _start_refresh_if_needed()
+        provider_allowlist = _provider_allowlist_from_render_args(snapshot, kwargs)
+        render_providers = provider_allowlist if provider_allowlist is not None else PROVIDERS
+        if not render_providers:
+            return None
+
+        _start_refresh_if_needed(render_providers)
         with _cache_lock:
             cache_snapshot = {
-                **{provider: _cache[provider] for provider in PROVIDERS},
+                **{provider: _cache[provider] for provider in render_providers},
                 "stale": set(_cache["stale"]),
             }
 
         parts = []
-        for provider in PROVIDERS:
+        for provider in render_providers:
             data = cache_snapshot[provider]
             is_stale = provider in cache_snapshot["stale"]
             if provider not in _PROVIDERS and data is None and not is_stale:

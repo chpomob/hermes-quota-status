@@ -435,6 +435,20 @@ class HermesQuotaStatusTests(unittest.TestCase):
     def setUp(self) -> None:
         self.plugin = load_plugin()
 
+    def _seed_all_provider_cache(self) -> None:
+        self.plugin._cache["claude"] = {"session_pct": 24.0, "reset_iso": ""}
+        self.plugin._cache["codex"] = {"session_pct": 11.0, "reset_iso": ""}
+        self.plugin._cache["gemini"] = {"key_valid": True, "probe": {"status": 200}}
+        self.plugin._cache["glm"] = {"session_pct": 28.0, "reset_iso": ""}
+        self.plugin._cache["deepseek"] = {
+            "is_available": True,
+            "currency": "USD",
+            "balance": 3.5,
+            "total_balance": 3.5,
+            "total_balance_display": "3.50",
+        }
+        self.plugin._cache["stale"].clear()
+
     def test_fetch_claude_missing_token_returns_none(self) -> None:
         with patch.object(self.plugin, "fetch_claude_quota", return_value=None):
             self.assertIsNone(self.plugin._fetch_claude())
@@ -728,7 +742,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
 
         with patch.object(self.plugin.threading, "Thread", return_value=fake_thread):
             with self.assertRaises(RuntimeError):
-                self.plugin._start_refresh_if_needed()
+                self.plugin._start_refresh_if_needed(self.plugin.PROVIDERS)
 
         self.assertFalse(self.plugin._cache["refreshing"])
 
@@ -1003,13 +1017,51 @@ class HermesQuotaStatusTests(unittest.TestCase):
 
         self.assertEqual(self.plugin._due_providers(0.0), active_fetchers)
 
+    def test_render_reads_provider_allowlist_from_snapshot_config(self) -> None:
+        self._seed_all_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed") as start_refresh:
+            rendered = self.plugin.on_status_bar_render(
+                {"config": {"quota_status": {"providers": ["claude", "deepseek"]}}}
+            )
+
+        start_refresh.assert_called_once_with(("claude", "deepseek"))
+        self.assertEqual(rendered, "🟢 C:24% │ 🟢 D:$3.50")
+
+    def test_render_reads_provider_allowlist_from_render_context_kwargs(self) -> None:
+        self._seed_all_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render(
+                render_context={"config_snapshot": {"quota_status": {"providers": ["deepseek"]}}}
+            )
+
+        self.assertEqual(rendered, "🟢 D:$3.50")
+
+    def test_render_provider_allowlist_is_case_sensitive(self) -> None:
+        self._seed_all_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["claude", "GLM"]}})
+
+        self.assertEqual(rendered, "🟢 C:24%")
+        self.assertNotIn(" G:", rendered)
+
+    def test_render_without_configured_allowlist_preserves_available_provider_rendering(self) -> None:
+        self._seed_all_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"config": {}})
+
+        self.assertEqual(rendered, "🟢 C:24% │ 🟢 Cx:11% │ 🟢 Ge:OK │ 🟢 G:28% │ 🟢 D:$3.50")
+
     def test_render_does_not_call_refresh_inline(self) -> None:
         with patch.object(self.plugin, "_refresh_cache", side_effect=AssertionError("sync refresh")), patch.object(
             self.plugin, "_start_refresh_if_needed"
         ) as start_refresh:
             rendered = self.plugin.on_status_bar_render()
 
-        start_refresh.assert_called_once_with()
+        start_refresh.assert_called_once_with(self.plugin.PROVIDERS)
         self.assertEqual(rendered, "🔴 C:? │ 🔴 Cx:? │ 🔴 Ge:? │ 🔴 G:? │ 🔴 D:?")
 
     def test_render_catches_unexpected_exception(self) -> None:
