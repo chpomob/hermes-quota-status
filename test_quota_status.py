@@ -737,7 +737,16 @@ class HermesQuotaStatusTests(unittest.TestCase):
         self.assertEqual(self.plugin._fmt_reset(None), "?")
         self.assertEqual(self.plugin._fmt_hours_until(["bad"]), "?")
         self.assertEqual(self.plugin._fmt_reset("not-a-date"), "?")
-        self.assertRegex(self.plugin._fmt_reset("2026-06-02T18:10:00Z"), r"^\d{2}h\d{2}$")
+        base = datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc)
+        future = (base + timedelta(hours=3, minutes=42)).isoformat().replace("+00:00", "Z")
+        multi_day = (base + timedelta(days=6, hours=12)).isoformat().replace("+00:00", "Z")
+        current = base.isoformat().replace("+00:00", "Z")
+        expired = (base - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+        with patch.object(self.plugin, "_now_utc", return_value=base):
+            self.assertEqual(self.plugin._fmt_reset(future), "3h42m")
+            self.assertEqual(self.plugin._fmt_reset(multi_day), "6d12h")
+            self.assertEqual(self.plugin._fmt_reset(current), "0h0m")
+            self.assertEqual(self.plugin._fmt_reset(expired), "0h0m")
 
     def test_render_provider_thresholds_and_stale_states(self) -> None:
         cases = [
@@ -754,6 +763,154 @@ class HermesQuotaStatusTests(unittest.TestCase):
         for data, stale, expected in cases:
             with self.subTest(data=data, stale=stale):
                 self.assertEqual(self.plugin._render_provider("claude", data, stale), expected)
+
+    def test_render_glm_success_uses_g_quota_segment(self) -> None:
+        self.assertEqual(
+            self.plugin._render_provider(
+                "glm",
+                {"session_pct": 28.0, "session_reset": "2026-07-10T00:00:00Z", "reset_iso": "2026-07-10T00:00:00Z"},
+                False,
+            ),
+            "🟢 G:28%",
+        )
+
+    def test_render_glm_balance_only_uses_balance_segment(self) -> None:
+        self.assertEqual(
+            self.plugin._render_provider(
+                "glm",
+                {"host": "https://open.bigmodel.cn", "balance": 12.5, "reset_iso": None, "session_reset": None},
+                False,
+            ),
+            "🟢 G:12.50",
+        )
+
+    def test_render_glm_derives_quota_from_raw_available_fields(self) -> None:
+        self.assertEqual(
+            self.plugin._render_provider(
+                "glm",
+                {"available_limit_pct": 25.0, "reset_iso": ""},
+                False,
+            ),
+            "🟡 G:75%",
+        )
+        self.assertEqual(
+            self.plugin._render_provider(
+                "glm",
+                {"remaining_fraction": 0.8, "reset_iso": ""},
+                False,
+            ),
+            "🟢 G:20%",
+        )
+
+    def test_render_deepseek_success_uses_balance_segment(self) -> None:
+        self.assertEqual(
+            self.plugin._render_provider(
+                "deepseek",
+                {
+                    "is_available": True,
+                    "currency": "USD",
+                    "balance": 3.5,
+                    "total_balance": 3.5,
+                    "total_balance_display": "3.50",
+                },
+                False,
+            ),
+            "🟢 D:$3.50",
+        )
+
+    def test_render_deepseek_uses_granted_balance_when_total_is_missing(self) -> None:
+        self.assertEqual(
+            self.plugin._render_provider(
+                "deepseek",
+                {
+                    "is_available": True,
+                    "currency": "USD",
+                    "granted_balance": 5.0,
+                    "granted_balance_display": "5.00",
+                },
+                False,
+            ),
+            "🟢 D:$5.00",
+        )
+
+    def test_render_gemini_uses_ge_without_standalone_g(self) -> None:
+        rendered = self.plugin._render_provider("gemini", {"key_valid": True, "probe": {"status": 200}}, False)
+
+        self.assertEqual(rendered, "🟢 Ge:OK")
+        self.assertNotIn(" G:", rendered)
+
+    def test_render_claude_dual_and_single_windows(self) -> None:
+        dual = self.plugin._render_provider(
+            "claude",
+            {
+                "windows": [
+                    {"name": "five_hour", "label": "5h", "pct": 24.0, "reset_iso": ""},
+                    {"name": "seven_day", "label": "7d", "pct": 61.0, "reset_iso": ""},
+                ]
+            },
+            False,
+        )
+        single = self.plugin._render_provider(
+            "claude",
+            {"windows": [{"name": "five_hour", "label": "5h", "pct": 23.0, "reset_iso": ""}]},
+            False,
+        )
+
+        self.assertIn("C:", dual)
+        self.assertIn("5h:24%", dual)
+        self.assertIn("7d:61%", dual)
+        self.assertIn("C:", single)
+        self.assertIn("5h:23%", single)
+        self.assertNotIn("7d", single)
+
+    def test_render_codex_dual_and_single_windows(self) -> None:
+        dual = self.plugin._render_provider(
+            "codex",
+            {
+                "windows": [
+                    {"name": "primary", "label": "P", "pct": 22.0, "reset_iso": ""},
+                    {"name": "secondary", "label": "S", "pct": 63.0, "reset_iso": ""},
+                ]
+            },
+            False,
+        )
+        single = self.plugin._render_provider(
+            "codex",
+            {"windows": [{"name": "secondary", "label": "S", "pct": 41.0, "reset_iso": ""}]},
+            False,
+        )
+
+        self.assertIn("Cx:", dual)
+        self.assertIn("P:22%", dual)
+        self.assertIn("S:63%", dual)
+        self.assertIn("Cx:", single)
+        self.assertIn("S:41%", single)
+        self.assertNotIn("P:", single)
+
+    def test_render_reset_countdown_is_relative_without_absolute_timestamp(self) -> None:
+        base = datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc)
+        future = (base + timedelta(hours=3, minutes=42)).isoformat().replace("+00:00", "Z")
+
+        with patch.object(self.plugin, "_now_utc", return_value=base):
+            rendered = self.plugin._render_provider("claude", {"session_pct": 100.0, "reset_iso": future}, False)
+
+        self.assertEqual(rendered, "🔴 C:FULL 3h42m")
+        self.assertNotIn("2026", rendered)
+        self.assertNotIn("18h", rendered)
+
+    def test_render_current_and_expired_resets_as_zero_countdown(self) -> None:
+        base = datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc)
+        current = base.isoformat().replace("+00:00", "Z")
+        expired = (base - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+
+        with patch.object(self.plugin, "_now_utc", return_value=base):
+            current_rendered = self.plugin._render_provider("claude", {"session_pct": 100.0, "reset_iso": current}, False)
+            expired_rendered = self.plugin._render_provider("claude", {"session_pct": 100.0, "reset_iso": expired}, False)
+
+        self.assertEqual(current_rendered, "🔴 C:FULL 0h0m")
+        self.assertEqual(expired_rendered, "🔴 C:FULL 0h0m")
+        self.assertNotIn("14h00", current_rendered)
+        self.assertNotIn("13h59", expired_rendered)
 
     def test_render_provider_omits_missing_reset_for_explicit_windows(self) -> None:
         rendered = self.plugin._render_provider(
@@ -832,7 +989,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
 
     def test_v2_provider_identity_order_and_cache_initialization(self) -> None:
         expected = ("claude", "codex", "gemini", "glm", "deepseek")
-        active_fetchers = ("claude", "codex", "gemini")
+        active_fetchers = expected
 
         self.assertEqual(self.plugin.PROVIDERS, expected)
         self.assertEqual(tuple(self.plugin._PROVIDERS), active_fetchers)
@@ -853,7 +1010,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
             rendered = self.plugin.on_status_bar_render()
 
         start_refresh.assert_called_once_with()
-        self.assertEqual(rendered, "🔴 C:? │ 🔴 Cx:? │ 🔴 Ge:?")
+        self.assertEqual(rendered, "🔴 C:? │ 🔴 Cx:? │ 🔴 Ge:? │ 🔴 G:? │ 🔴 D:?")
 
     def test_render_catches_unexpected_exception(self) -> None:
         with patch.object(self.plugin, "_start_refresh_if_needed"), patch.object(

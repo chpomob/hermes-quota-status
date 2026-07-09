@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import ssl
 import sys
@@ -27,7 +28,9 @@ try:
     from .quota_api import (
         fetch_claude_quota,
         fetch_codex_quota,
+        fetch_deepseek_balance,
         fetch_gemini_quota,
+        fetch_glm_quota,
         get_claude_token,
         get_codex_token,
         get_gemini_key,
@@ -46,7 +49,9 @@ except ImportError:
     from quota_api import (  # type: ignore[no-redef]
         fetch_claude_quota,
         fetch_codex_quota,
+        fetch_deepseek_balance,
         fetch_gemini_quota,
+        fetch_glm_quota,
         get_claude_token,
         get_codex_token,
         get_gemini_key,
@@ -81,7 +86,9 @@ __all__ = [
     "PROVIDER_SHORT",
     "fetch_claude_quota",
     "fetch_codex_quota",
+    "fetch_deepseek_balance",
     "fetch_gemini_quota",
+    "fetch_glm_quota",
     "cloudcode_login",
     "cloudcode_login_pending",
     "get_claude_token",
@@ -157,6 +164,17 @@ class ProviderQuota(TypedDict, total=False):
     cloudcode_error: str
     agy_scrape: bool
     remaining_fraction: float
+    available_limit_pct: float
+    balance: float
+    total_balance: float
+    total_balance_display: str
+    granted_balance: float
+    granted_balance_display: str
+    topped_up_balance: float
+    topped_up_balance_display: str
+    currency: str
+    is_available: bool
+    host: str
     prompt_credits: float
     monthly_prompt_credits: float
     plan_type: str
@@ -278,6 +296,16 @@ def _fetch_codex() -> ProviderQuota | None:
     if data is None:
         return None
     return _shared_window_quota(data, QUOTA_WINDOW_SPECS["codex"])
+
+
+def _fetch_glm() -> ProviderQuota | None:
+    data = fetch_glm_quota()
+    return cast(ProviderQuota | None, data)
+
+
+def _fetch_deepseek() -> ProviderQuota | None:
+    data = fetch_deepseek_balance()
+    return cast(ProviderQuota | None, data)
 
 
 def _short_model_name(model_id: str) -> str:
@@ -580,6 +608,8 @@ _PROVIDERS: Final[dict[ProviderName, Callable[[], ProviderQuota | None]]] = {
     "claude": _fetch_claude,
     "codex": _fetch_codex,
     "gemini": _fetch_gemini,
+    "glm": _fetch_glm,
+    "deepseek": _fetch_deepseek,
 }
 
 
@@ -690,12 +720,24 @@ def _start_refresh_if_needed() -> None:
         raise
 
 
-def _fmt_reset(iso_str: str) -> str:
-    """Format an API reset timestamp as local HHhMM; return '?' for missing or invalid values."""
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _fmt_reset(iso_str: Any) -> str:
+    """Format an API reset timestamp as a relative countdown; return '?' for missing or invalid values."""
     dt = gemini_cloudcode.parse_reset_time(iso_str)
     if dt is None:
         return "?"
-    return dt.astimezone().strftime("%Hh%M")
+    seconds = (dt - _now_utc()).total_seconds()
+    if seconds <= 0:
+        return "0h0m"
+    minutes = int(math.ceil(seconds / 60.0))
+    if minutes >= 24 * 60:
+        days = minutes // (24 * 60)
+        hours = (minutes % (24 * 60)) // 60
+        return f"{days}d{hours}h"
+    return f"{minutes // 60}h{minutes % 60}m"
 
 
 def _fmt_hours_until(iso_str: str) -> str:
@@ -709,6 +751,62 @@ def _fmt_hours_until(iso_str: str) -> str:
 
 def _fmt_pct(pct: float) -> str:
     return f"{int(pct)}%"
+
+
+def _first_balance_number(data: ProviderQuota) -> float | None:
+    for key in ("balance", "total_balance", "granted_balance", "topped_up_balance"):
+        number = json_number_or_none(data.get(key))
+        if number is not None:
+            return number
+    return None
+
+
+def _balance_display(data: ProviderQuota) -> str:
+    amount = ""
+    for display_key in ("total_balance_display", "granted_balance_display", "topped_up_balance_display"):
+        display = data.get(display_key)
+        if isinstance(display, str) and display:
+            amount = display
+            break
+    if not amount:
+        balance = _first_balance_number(data)
+        if balance is None:
+            return ""
+        amount = f"{balance:.2f}"
+
+    currency = data.get("currency")
+    if currency == "USD":
+        return amount if amount.startswith("$") else f"${amount}"
+    if isinstance(currency, str) and currency:
+        return f"{amount} {currency}"
+    return amount
+
+
+def _render_deepseek(data: ProviderQuota | None, is_stale: bool) -> str:
+    short = PROVIDER_SHORT["deepseek"]
+    if data is None or is_stale:
+        return f"🔴 {short}:?"
+
+    display = _balance_display(data)
+    if not display:
+        return f"🟡 {short}:?"
+
+    balance = _first_balance_number(data)
+    is_available = data.get("is_available")
+    if is_available is False or (balance is not None and balance <= 0.0):
+        return f"🔴 {short}:{display}"
+    return f"🟢 {short}:{display}"
+
+
+def _render_balance_provider(short: str, data: ProviderQuota, unknown_status: str = "🟡") -> str:
+    display = _balance_display(data)
+    if not display:
+        return f"{unknown_status} {short}:?"
+
+    balance = _first_balance_number(data)
+    if balance is not None and balance <= 0.0:
+        return f"🔴 {short}:{display}"
+    return f"🟢 {short}:{display}"
 
 
 def _render_gemini(data: ProviderQuota | None, is_stale: bool) -> str:
@@ -820,6 +918,22 @@ def _quota_windows_for_render(provider: ProviderName, data: ProviderQuota) -> tu
         data.get("session_pct"),
         data.get("reset_iso") or data.get("session_reset"),
     )
+    if session_window is None:
+        available_limit_pct = _quota_pct_or_none(data.get("available_limit_pct"))
+        if available_limit_pct is not None:
+            session_window = _quota_window_from_values(
+                _fallback_quota_window_label(provider, "session"),
+                100.0 - available_limit_pct,
+                data.get("reset_iso") or data.get("session_reset"),
+            )
+    if session_window is None:
+        remaining_fraction = json_number_or_none(data.get("remaining_fraction"))
+        if remaining_fraction is not None:
+            session_window = _quota_window_from_values(
+                _fallback_quota_window_label(provider, "session"),
+                100.0 - (max(0.0, min(1.0, remaining_fraction)) * 100.0),
+                data.get("reset_iso") or data.get("session_reset"),
+            )
     if session_window is not None:
         windows.append(session_window)
 
@@ -852,12 +966,16 @@ def _render_quota_window(window: QuotaWindowInfo, include_label: bool) -> str:
 def _render_provider(provider: ProviderName, data: ProviderQuota | None, is_stale: bool) -> str:
     if provider == "gemini":
         return _render_gemini(data, is_stale)
+    if provider == "deepseek":
+        return _render_deepseek(data, is_stale)
 
     short = PROVIDER_SHORT[provider]
     if data is None or is_stale:
         return f"🔴 {short}:?"
     windows, has_explicit_windows = _quota_windows_for_render(provider, data)
     if not windows:
+        if provider == "glm" and _first_balance_number(data) is not None:
+            return _render_balance_provider(short, data)
         return f"🟡 {short}:?"
 
     worst_pct = max(_quota_pct(window.get("pct")) for window in windows)
