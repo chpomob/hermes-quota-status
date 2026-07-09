@@ -15,6 +15,7 @@ import ssl
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -68,6 +69,18 @@ CONFIG_CONTAINER_KEYS: Final[tuple[str, ...]] = (
     "config",
     "config_snapshot",
     "snapshot",
+    "context",
+    "render_context",
+)
+STATUS_SEGMENT_SEPARATOR: Final[str] = " │ "
+NARROW_TERMINAL_WIDTH_LIMIT: Final[int] = 60
+TERMINAL_WIDTH_KEYS: Final[tuple[str, ...]] = ("terminal_width", "terminal_columns", "columns", "width")
+TERMINAL_WIDTH_CONTAINER_KEYS: Final[tuple[str, ...]] = (
+    "terminal",
+    "terminal_size",
+    "viewport",
+    "screen",
+    "dimensions",
     "context",
     "render_context",
 )
@@ -1008,6 +1021,84 @@ def _source_value(source: Any, key: str) -> Any:
     return getattr(source, key, None)
 
 
+def _terminal_width_value(raw_width: Any) -> int | None:
+    if isinstance(raw_width, bool):
+        return None
+    if isinstance(raw_width, int):
+        return raw_width if raw_width > 0 else None
+    if isinstance(raw_width, float):
+        if math.isfinite(raw_width) and raw_width > 0:
+            return int(raw_width)
+        return None
+    if isinstance(raw_width, str):
+        try:
+            width = int(raw_width.strip())
+        except ValueError:
+            return None
+        return width if width > 0 else None
+    return None
+
+
+def _terminal_width_from_source(source: Any, *, depth: int = 0, seen: set[int] | None = None) -> int | None:
+    if source is None or depth > 4:
+        return None
+    if seen is None:
+        seen = set()
+    source_id = id(source)
+    if source_id in seen:
+        return None
+    seen.add(source_id)
+
+    for key in TERMINAL_WIDTH_KEYS:
+        width = _terminal_width_value(_source_value(source, key))
+        if width is not None:
+            return width
+
+    for key in TERMINAL_WIDTH_CONTAINER_KEYS:
+        width = _terminal_width_from_source(_source_value(source, key), depth=depth + 1, seen=seen)
+        if width is not None:
+            return width
+    return None
+
+
+def _terminal_width_from_render_args(snapshot: Any, kwargs: Mapping[str, Any]) -> int | None:
+    width = _terminal_width_from_source(snapshot)
+    if width is not None:
+        return width
+    return _terminal_width_from_source(kwargs)
+
+
+def _display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        category = unicodedata.category(char)
+        if category in {"Mn", "Me", "Cf"} or category.startswith("C"):
+            continue
+        if unicodedata.east_asian_width(char) in {"F", "W"}:
+            width += 2
+            continue
+        width += 1
+    return width
+
+
+def _trim_status_parts_for_width(parts: list[str], terminal_width: int | None) -> str | None:
+    if terminal_width is None:
+        return STATUS_SEGMENT_SEPARATOR.join(parts)
+
+    selected: list[str] = []
+    for part in parts:
+        candidate = STATUS_SEGMENT_SEPARATOR.join([*selected, part])
+        if _display_width(candidate) <= terminal_width:
+            selected.append(part)
+            continue
+        break
+    if not selected:
+        return None
+    return STATUS_SEGMENT_SEPARATOR.join(selected)
+
+
 def _normalize_provider_allowlist(raw_providers: Any) -> tuple[ProviderName, ...] | None:
     if raw_providers is None or isinstance(raw_providers, str | bytes | bytearray) or isinstance(raw_providers, Mapping):
         return None
@@ -1084,6 +1175,7 @@ def on_status_bar_render(snapshot=None, **kwargs) -> str | None:
     """
     try:
         provider_allowlist = _provider_allowlist_from_render_args(snapshot, kwargs)
+        terminal_width = _terminal_width_from_render_args(snapshot, kwargs)
         render_providers = provider_allowlist if provider_allowlist is not None else PROVIDERS
         if not render_providers:
             return None
@@ -1102,7 +1194,7 @@ def on_status_bar_render(snapshot=None, **kwargs) -> str | None:
             if provider not in _PROVIDERS and data is None and not is_stale:
                 continue
             parts.append(_render_provider(provider, data, is_stale))
-        return " │ ".join(parts)
+        return _trim_status_parts_for_width(parts, terminal_width)
     except Exception as exc:
         logger.warning(
             "quota status render failed",

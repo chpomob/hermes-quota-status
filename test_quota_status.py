@@ -449,6 +449,30 @@ class HermesQuotaStatusTests(unittest.TestCase):
         }
         self.plugin._cache["stale"].clear()
 
+    def _seed_wide_provider_cache(self) -> None:
+        self.plugin._cache["claude"] = {
+            "windows": [
+                {"name": "five_hour", "label": "5h", "pct": 24.0, "reset_iso": ""},
+                {"name": "seven_day", "label": "7d", "pct": 61.0, "reset_iso": ""},
+            ]
+        }
+        self.plugin._cache["codex"] = {
+            "windows": [
+                {"name": "primary", "label": "P", "pct": 22.0, "reset_iso": ""},
+                {"name": "secondary", "label": "S", "pct": 63.0, "reset_iso": ""},
+            ]
+        }
+        self.plugin._cache["gemini"] = {"cloudcode": True, "prompt_credits": 600.0, "monthly_prompt_credits": 1500.0}
+        self.plugin._cache["glm"] = {"session_pct": 28.0, "reset_iso": ""}
+        self.plugin._cache["deepseek"] = {
+            "is_available": True,
+            "currency": "USD",
+            "balance": 3.5,
+            "total_balance": 3.5,
+            "total_balance_display": "3.50",
+        }
+        self.plugin._cache["stale"].clear()
+
     def test_fetch_claude_missing_token_returns_none(self) -> None:
         with patch.object(self.plugin, "fetch_claude_quota", return_value=None):
             self.assertIsNone(self.plugin._fetch_claude())
@@ -1054,6 +1078,79 @@ class HermesQuotaStatusTests(unittest.TestCase):
             rendered = self.plugin.on_status_bar_render({"config": {}})
 
         self.assertEqual(rendered, "🟢 C:24% │ 🟢 Cx:11% │ 🟢 Ge:OK │ 🟢 G:28% │ 🟢 D:$3.50")
+
+    def test_render_width_60_trims_to_limit(self) -> None:
+        self._seed_wide_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"terminal_width": 60})
+
+        self.assertIsNotNone(rendered)
+        self.assertLessEqual(self.plugin._display_width(rendered), 60)
+        self.assertEqual(rendered, "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63%")
+
+    def test_render_width_30_uses_actual_reported_width(self) -> None:
+        self._seed_wide_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"terminal_width": 30})
+
+        self.assertIsNotNone(rendered)
+        self.assertLessEqual(self.plugin._display_width(rendered), 30)
+        self.assertEqual(rendered, "🟡 C:5h:24% 7d:61%")
+
+    def test_render_width_60_trims_at_well_formed_segment_boundaries(self) -> None:
+        self._seed_wide_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render(render_context={"terminal": {"columns": 60}})
+
+        self.assertEqual(rendered, "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63%")
+        self.assertFalse(rendered.startswith(" │ "))
+        self.assertFalse(rendered.endswith(" │ "))
+        self.assertNotIn("│ │", rendered)
+        self.assertEqual(
+            rendered.split(" │ "),
+            ["🟡 C:5h:24% 7d:61%", "🟡 Cx:P:22% S:63%"],
+        )
+
+    def test_render_width_61_trims_to_reported_width(self) -> None:
+        self._seed_wide_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"terminal_width": 61})
+
+        self.assertIsNotNone(rendered)
+        self.assertLessEqual(self.plugin._display_width(rendered), 61)
+        self.assertEqual(rendered, "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63%")
+
+    def test_render_too_narrow_for_first_segment_returns_none(self) -> None:
+        self._seed_wide_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"terminal_width": 10})
+
+        self.assertIsNone(rendered)
+
+    def test_render_reads_plain_width_from_nested_terminal_context(self) -> None:
+        self._seed_wide_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"terminal": {"width": 30}})
+
+        self.assertEqual(rendered, "🟡 C:5h:24% 7d:61%")
+
+    def test_render_missing_width_does_not_apply_60_character_cap(self) -> None:
+        self._seed_wide_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"config": {}})
+
+        self.assertEqual(
+            rendered,
+            "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28% │ 🟢 D:$3.50",
+        )
+        self.assertGreater(len(rendered), 60)
 
     def test_render_does_not_call_refresh_inline(self) -> None:
         with patch.object(self.plugin, "_refresh_cache", side_effect=AssertionError("sync refresh")), patch.object(
