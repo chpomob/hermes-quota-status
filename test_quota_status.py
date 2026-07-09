@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import tempfile
 import time
 import urllib.error
@@ -19,6 +20,102 @@ PLUGIN_PATH = Path(__file__).with_name("__init__.py")
 PLUGIN_METADATA_PATH = Path(__file__).with_name("plugin.yaml")
 CLOUDCODE_PATH = Path(__file__).with_name("gemini_cloudcode.py")
 QUOTA_API_PATH = Path(__file__).with_name("quota_api.py")
+SPEC_PATH = Path(__file__).with_name("spec.md")
+
+ACCEPTANCE_COVERAGE: dict[str, tuple[str, ...]] = {
+    "AC1": ("test_acceptance_status_bar_contains_successful_glm_and_deepseek_segments",),
+    "AC2": ("test_fetch_glm_quota_uses_raw_non_bearer_authorization",),
+    "AC3": ("test_acceptance_glm_missing_credentials_omits_glm_from_successful_status_output",),
+    "AC4": ("test_fetch_glm_quota_falls_back_to_open_bigmodel_after_primary_failure",),
+    "AC5": ("test_acceptance_status_bar_contains_successful_glm_and_deepseek_segments",),
+    "AC6": ("test_fetch_deepseek_balance_uses_exact_url_and_bearer_authorization",),
+    "AC7": ("test_acceptance_deepseek_missing_credentials_omits_deepseek_from_successful_status_output",),
+    "AC8": ("test_fetch_deepseek_balance_uses_exact_url_and_bearer_authorization",),
+    "AC9": ("test_render_gemini_uses_ge_without_standalone_g",),
+    "AC10": ("test_render_glm_success_uses_g_quota_segment",),
+    "AC11": ("test_render_claude_dual_and_single_windows",),
+    "AC12": ("test_render_codex_dual_and_single_windows",),
+    "AC13": ("test_render_reads_provider_allowlist_from_snapshot_config",),
+    "AC14": ("test_render_reads_provider_allowlist_from_snapshot_config",),
+    "AC15": ("test_render_reset_countdown_is_relative_without_absolute_timestamp",),
+    "AC16": ("test_render_current_and_expired_resets_as_zero_countdown",),
+    "AC17": ("test_render_width_60_trims_to_limit",),
+    "AC18": ("test_render_width_60_trims_at_well_formed_segment_boundaries",),
+    "AC19": ("test_auth_failure_suppresses_provider_after_third_consecutive_failure",),
+    "AC20": ("test_auth_failure_suppression_is_independent_per_provider",),
+    "AC21": ("test_suppression_recovery_renders_provider_after_successful_refresh",),
+    "AC22": ("test_acceptance_claude_codex_and_gemini_render_one_segment_each_when_available",),
+    "AC23": ("test_plugin_metadata_documents_v2_providers_and_config_surface",),
+    "AC24": (
+        "test_acceptance_status_bar_contains_successful_glm_and_deepseek_segments",
+        "test_get_glm_key_prefers_glm_api_key_over_zhipu_api_key",
+        "test_fetch_glm_quota_falls_back_to_open_bigmodel_after_primary_failure",
+        "test_render_gemini_uses_ge_without_standalone_g",
+        "test_render_glm_success_uses_g_quota_segment",
+        "test_render_claude_dual_and_single_windows",
+        "test_render_codex_dual_and_single_windows",
+        "test_render_reads_provider_allowlist_from_snapshot_config",
+        "test_render_reset_countdown_is_relative_without_absolute_timestamp",
+        "test_render_current_and_expired_resets_as_zero_countdown",
+        "test_render_width_60_trims_to_limit",
+        "test_auth_failure_suppresses_provider_after_third_consecutive_failure",
+        "test_non_auth_failures_leave_auth_failure_counter_unchanged",
+        "test_suppression_recovery_renders_provider_after_successful_refresh",
+    ),
+    "AC25": ("test_fetch_glm_quota_uses_glm_api_key_header_when_both_credentials_are_set",),
+    "AC26": ("test_render_glm_uses_quota_data_from_fallback_host",),
+    "AC27": ("test_render_claude_dual_and_single_windows",),
+    "AC28": ("test_render_codex_dual_and_single_windows",),
+    "AC29": ("test_render_provider_allowlist_is_case_sensitive",),
+    "AC30": (
+        "test_render_width_above_60_does_not_apply_fixed_60_character_cap",
+        "test_render_missing_width_does_not_apply_60_character_cap",
+    ),
+    "AC31": (
+        "test_v2_provider_identity_order_and_cache_initialization",
+        "test_non_auth_failures_leave_auth_failure_counter_unchanged",
+        "test_successful_authenticated_check_resets_auth_failure_counter",
+    ),
+    "AC32": ("test_suppressed_provider_is_fetched_on_later_refreshes",),
+}
+
+
+ACCEPTANCE_IDS_BY_TEST_METHOD: dict[str, tuple[str, ...]] = {
+    "test_acceptance_status_bar_contains_successful_glm_and_deepseek_segments": ("AC1", "AC5", "AC24"),
+    "test_fetch_glm_quota_uses_raw_non_bearer_authorization": ("AC2",),
+    "test_acceptance_glm_missing_credentials_omits_glm_from_successful_status_output": ("AC3",),
+    "test_fetch_glm_quota_falls_back_to_open_bigmodel_after_primary_failure": ("AC4", "AC24"),
+    "test_fetch_deepseek_balance_uses_exact_url_and_bearer_authorization": ("AC6", "AC8"),
+    "test_acceptance_deepseek_missing_credentials_omits_deepseek_from_successful_status_output": ("AC7",),
+    "test_render_gemini_uses_ge_without_standalone_g": ("AC9", "AC24"),
+    "test_render_glm_success_uses_g_quota_segment": ("AC10", "AC24"),
+    "test_render_claude_dual_and_single_windows": ("AC11", "AC24", "AC27"),
+    "test_render_codex_dual_and_single_windows": ("AC12", "AC24", "AC28"),
+    "test_render_reads_provider_allowlist_from_snapshot_config": ("AC13", "AC14", "AC24"),
+    "test_render_reset_countdown_is_relative_without_absolute_timestamp": ("AC15", "AC24"),
+    "test_render_current_and_expired_resets_as_zero_countdown": ("AC16", "AC24"),
+    "test_render_width_60_trims_to_limit": ("AC17", "AC24"),
+    "test_render_width_60_trims_at_well_formed_segment_boundaries": ("AC18",),
+    "test_auth_failure_suppresses_provider_after_third_consecutive_failure": ("AC19", "AC24"),
+    "test_auth_failure_suppression_is_independent_per_provider": ("AC20",),
+    "test_suppression_recovery_renders_provider_after_successful_refresh": ("AC21", "AC24"),
+    "test_acceptance_claude_codex_and_gemini_render_one_segment_each_when_available": ("AC22",),
+    "test_plugin_metadata_documents_v2_providers_and_config_surface": ("AC23",),
+    "test_get_glm_key_prefers_glm_api_key_over_zhipu_api_key": ("AC24",),
+    "test_non_auth_failures_leave_auth_failure_counter_unchanged": ("AC24", "AC31"),
+    "test_fetch_glm_quota_uses_glm_api_key_header_when_both_credentials_are_set": ("AC25",),
+    "test_render_glm_uses_quota_data_from_fallback_host": ("AC26",),
+    "test_render_provider_allowlist_is_case_sensitive": ("AC29",),
+    "test_render_width_above_60_does_not_apply_fixed_60_character_cap": ("AC30",),
+    "test_render_missing_width_does_not_apply_60_character_cap": ("AC30",),
+    "test_v2_provider_identity_order_and_cache_initialization": ("AC31",),
+    "test_successful_authenticated_check_resets_auth_failure_counter": ("AC31",),
+    "test_suppressed_provider_is_fetched_on_later_refreshes": ("AC32",),
+}
+
+
+def acceptance_ids_from_spec() -> set[str]:
+    return set(re.findall(r"^- (AC\d+) \(", SPEC_PATH.read_text(encoding="utf-8"), flags=re.MULTILINE))
 
 
 def load_plugin() -> ModuleType:
@@ -70,6 +167,33 @@ class PluginMetadataTests(unittest.TestCase):
         self.assertEqual(tuple(documented_provider_names), plugin.PROVIDERS)
 
         self.assertEqual(metadata["provides_hooks"], ["on_status_bar_render"])
+
+
+class AcceptanceCoverageAuditTests(unittest.TestCase):
+    def test_acceptance_coverage_maps_every_ac_to_existing_unittest_methods(self) -> None:
+        expected_ids = acceptance_ids_from_spec()
+        self.assertEqual(set(ACCEPTANCE_COVERAGE), expected_ids)
+
+        test_methods = {
+            method_name: method
+            for obj in globals().values()
+            if isinstance(obj, type) and issubclass(obj, unittest.TestCase)
+            for method_name, method in obj.__dict__.items()
+            if method_name.startswith("test_")
+        }
+        for acceptance_id, method_names in ACCEPTANCE_COVERAGE.items():
+            with self.subTest(acceptance_id=acceptance_id):
+                self.assertTrue(method_names)
+                for method_name in method_names:
+                    self.assertIn(method_name, test_methods)
+                    self.assertIn(acceptance_id, ACCEPTANCE_IDS_BY_TEST_METHOD.get(method_name, ()))
+
+        for method_name, acceptance_ids in ACCEPTANCE_IDS_BY_TEST_METHOD.items():
+            with self.subTest(method_name=method_name):
+                self.assertIn(method_name, test_methods)
+                self.assertLessEqual(set(acceptance_ids), expected_ids)
+                for acceptance_id in acceptance_ids:
+                    self.assertIn(method_name, ACCEPTANCE_COVERAGE[acceptance_id])
 
 
 class QuotaApiDeepSeekTests(unittest.TestCase):
@@ -326,6 +450,23 @@ class QuotaApiGlmTests(unittest.TestCase):
 
         self.assertEqual(requests[0].get_header("Authorization"), "raw-zhipu-key")
         self.assertNotIn("Bearer", requests[0].get_header("Authorization"))
+
+    def test_fetch_glm_quota_uses_glm_api_key_header_when_both_credentials_are_set(self) -> None:
+        requests = []
+
+        def fake_fetch(req):
+            requests.append(req)
+            return {"data": {"availableLimitPercentage": 100}}
+
+        with patch.dict(
+            self.quota_api.os.environ,
+            {"GLM_API_KEY": "glm-raw", "ZHIPU_API_KEY": "zhipu-raw"},
+            clear=True,
+        ), patch.object(self.quota_api, "fetch_json", side_effect=fake_fetch):
+            self.quota_api.fetch_glm_quota()
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].get_header("Authorization"), "glm-raw")
 
     def test_fetch_glm_quota_falls_back_to_open_bigmodel_after_primary_failure(self) -> None:
         urls = []
@@ -1312,6 +1453,92 @@ class HermesQuotaStatusTests(unittest.TestCase):
 
         self.assertEqual(rendered, "🟢 C:24% │ 🟢 Cx:11% │ 🟢 Ge:OK │ 🟢 G:28% │ 🟢 D:$3.50")
 
+    def test_acceptance_status_bar_contains_successful_glm_and_deepseek_segments(self) -> None:
+        glm_fetcher = MagicMock(return_value={"session_pct": 28.0, "reset_iso": ""})
+        deepseek_fetcher = MagicMock(
+            return_value={
+                "is_available": True,
+                "currency": "USD",
+                "balance": 3.5,
+                "total_balance": 3.5,
+                "total_balance_display": "3.50",
+            }
+        )
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"glm": glm_fetcher, "deepseek": deepseek_fetcher},
+            clear=True,
+        ):
+            self.plugin._refresh_cache(("glm", "deepseek"))
+
+        with patch.object(self.plugin, "_start_refresh_if_needed") as start_refresh:
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["glm", "deepseek"]}})
+
+        glm_fetcher.assert_called_once_with()
+        deepseek_fetcher.assert_called_once_with()
+        start_refresh.assert_called_once_with(("glm", "deepseek"))
+        self.assertEqual(rendered, "🟢 G:28% │ 🟢 D:$3.50")
+
+    def test_acceptance_glm_missing_credentials_omits_glm_from_successful_status_output(self) -> None:
+        glm_fetcher = MagicMock(return_value=None)
+        deepseek_fetcher = MagicMock(
+            return_value={
+                "is_available": True,
+                "currency": "USD",
+                "balance": 3.5,
+                "total_balance": 3.5,
+                "total_balance_display": "3.50",
+            }
+        )
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"glm": glm_fetcher, "deepseek": deepseek_fetcher},
+            clear=True,
+        ):
+            self.plugin._refresh_cache(("glm", "deepseek"))
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["glm", "deepseek"]}})
+
+        glm_fetcher.assert_called_once_with()
+        deepseek_fetcher.assert_called_once_with()
+        self.assertEqual(rendered, "🟢 D:$3.50")
+        self.assertNotIn(" G:", rendered)
+
+    def test_acceptance_deepseek_missing_credentials_omits_deepseek_from_successful_status_output(self) -> None:
+        glm_fetcher = MagicMock(return_value={"session_pct": 28.0, "reset_iso": ""})
+        deepseek_fetcher = MagicMock(return_value=None)
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"glm": glm_fetcher, "deepseek": deepseek_fetcher},
+            clear=True,
+        ):
+            self.plugin._refresh_cache(("glm", "deepseek"))
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["glm", "deepseek"]}})
+
+        glm_fetcher.assert_called_once_with()
+        deepseek_fetcher.assert_called_once_with()
+        self.assertEqual(rendered, "🟢 G:28%")
+        self.assertNotIn(" D:", rendered)
+
+    def test_acceptance_claude_codex_and_gemini_render_one_segment_each_when_available(self) -> None:
+        self._seed_wide_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["claude", "codex", "gemini"]}})
+
+        self.assertIsNotNone(rendered)
+        segments = rendered.split(" │ ")
+        self.assertEqual(len(segments), 3)
+        self.assertEqual(segments[0], "🟡 C:5h:24% 7d:61%")
+        self.assertEqual(segments[1], "🟡 Cx:P:22% S:63%")
+        self.assertEqual(segments[2], "🟡 Ge:CREDITS 600/1500")
+
     def test_render_width_60_trims_to_limit(self) -> None:
         self._seed_wide_provider_cache()
 
@@ -1357,6 +1584,20 @@ class HermesQuotaStatusTests(unittest.TestCase):
         self.assertLessEqual(self.plugin._display_width(rendered), 61)
         self.assertEqual(rendered, "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63%")
 
+    def test_render_width_above_60_does_not_apply_fixed_60_character_cap(self) -> None:
+        self._seed_wide_provider_cache()
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"terminal_width": 80})
+
+        self.assertIsNotNone(rendered)
+        self.assertGreater(self.plugin._display_width(rendered), 60)
+        self.assertLessEqual(self.plugin._display_width(rendered), 80)
+        self.assertEqual(
+            rendered,
+            "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28%",
+        )
+
     def test_render_too_narrow_for_first_segment_returns_none(self) -> None:
         self._seed_wide_provider_cache()
 
@@ -1383,7 +1624,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
             rendered,
             "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28% │ 🟢 D:$3.50",
         )
-        self.assertGreater(len(rendered), 60)
+        self.assertGreater(self.plugin._display_width(rendered), 60)
 
     def test_render_does_not_call_refresh_inline(self) -> None:
         with patch.object(self.plugin, "_refresh_cache", side_effect=AssertionError("sync refresh")), patch.object(

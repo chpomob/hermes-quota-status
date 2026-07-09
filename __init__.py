@@ -98,6 +98,7 @@ CACHE_TTL: Final[int] = 120
 ERROR_RETRY_TTL: Final[int] = 30
 AUTH_RETRY_TTL: Final[int] = 300
 AUTH_FAILURE_SUPPRESSION_THRESHOLD: Final[int] = 3
+CREDENTIAL_REQUIRED_OMIT_PROVIDERS: Final[tuple[ProviderName, ...]] = ("glm", "deepseek")
 GEMINI_AUTH_ERROR_STRINGS: Final[tuple[str, ...]] = (
     "api key",
     "bad request",
@@ -226,6 +227,7 @@ class CacheState(TypedDict):
     ts: float
     refreshing: bool
     stale: set[ProviderName]
+    missing_credentials: set[ProviderName]
     next_retry: dict[ProviderName, float]
 
 
@@ -245,6 +247,7 @@ _cache: CacheState = {
     "ts": 0.0,
     "refreshing": False,
     "stale": set(),
+    "missing_credentials": set(),
     "next_retry": {provider: 0.0 for provider in PROVIDERS},
 }
 _cache_lock = threading.Lock()
@@ -666,6 +669,16 @@ def _provider_auth_suppressed(provider: ProviderName, auth_failure_counts: Mappi
     return auth_failure_counts.get(provider, 0) >= AUTH_FAILURE_SUPPRESSION_THRESHOLD
 
 
+def _provider_missing_credentials(
+    provider: ProviderName, missing_credentials: set[ProviderName] | frozenset[ProviderName]
+) -> bool:
+    return provider in CREDENTIAL_REQUIRED_OMIT_PROVIDERS and provider in missing_credentials
+
+
+def _mark_provider_credentials_available(provider: ProviderName) -> None:
+    _cache["missing_credentials"].discard(provider)
+
+
 def _provider_result_auth_error_type(provider: ProviderName, result: ProviderQuota) -> str | None:
     if provider != "gemini":
         return None
@@ -729,9 +742,13 @@ def _mark_provider_error(provider: ProviderName, error_type: str, *, http_status
         if error_type == "auth":
             _record_auth_failure(provider)
             _cache[provider] = None
+            _mark_provider_credentials_available(provider)
         elif error_type == "missing_token":
             _reset_auth_failures(provider)
             _cache[provider] = None
+            _cache["missing_credentials"].add(provider)
+        else:
+            _mark_provider_credentials_available(provider)
         _cache["next_retry"][provider] = now + _retry_ttl(error_type)
 
     logger.warning("quota refresh failed", extra={"quota_error": error})
@@ -745,20 +762,24 @@ def _store_provider_result(provider: ProviderName, result: ProviderQuota | None)
             _cache[provider] = None
             _cache["stale"].add(provider)
             _reset_auth_failures(provider)
+            _cache["missing_credentials"].add(provider)
             _cache["next_retry"][provider] = now + AUTH_RETRY_TTL
         else:
             _cache[provider] = result
             _cache["stale"].discard(provider)
+            _mark_provider_credentials_available(provider)
             result_error_type = _provider_result_auth_error_type(provider, result)
             if result_error_type == "auth":
                 _record_error({"provider": provider, "type": "auth", "timestamp": now})
                 _record_auth_failure(provider)
+                _mark_provider_credentials_available(provider)
                 _cache["next_retry"][provider] = now + AUTH_RETRY_TTL
             elif result_error_type == "missing_token":
                 _record_error({"provider": provider, "type": "missing_token", "timestamp": now})
                 _reset_auth_failures(provider)
                 _cache[provider] = None
                 _cache["stale"].add(provider)
+                _cache["missing_credentials"].add(provider)
                 _cache["next_retry"][provider] = now + AUTH_RETRY_TTL
             elif _provider_result_is_authenticated_success(provider, result):
                 _reset_auth_failures(provider)
@@ -1261,16 +1282,20 @@ def on_status_bar_render(snapshot=None, **kwargs) -> str | None:
             cache_snapshot = {
                 **{provider: _cache[provider] for provider in render_providers},
                 "stale": set(_cache["stale"]),
+                "missing_credentials": set(_cache["missing_credentials"]),
                 "auth_failure_counts": dict(_auth_failure_counts),
             }
 
         parts = []
         auth_failure_counts = cast(Mapping[ProviderName, int], cache_snapshot["auth_failure_counts"])
+        missing_credentials = cast(set[ProviderName], cache_snapshot["missing_credentials"])
         for provider in render_providers:
             if _provider_auth_suppressed(provider, auth_failure_counts):
                 continue
             data = cache_snapshot[provider]
             is_stale = provider in cache_snapshot["stale"]
+            if data is None and is_stale and _provider_missing_credentials(provider, missing_credentials):
+                continue
             if provider not in _PROVIDERS and data is None and not is_stale:
                 continue
             parts.append(_render_provider(provider, data, is_stale))
