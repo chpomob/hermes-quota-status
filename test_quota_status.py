@@ -12,8 +12,11 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock, patch
 
+import yaml
+
 
 PLUGIN_PATH = Path(__file__).with_name("__init__.py")
+PLUGIN_METADATA_PATH = Path(__file__).with_name("plugin.yaml")
 CLOUDCODE_PATH = Path(__file__).with_name("gemini_cloudcode.py")
 QUOTA_API_PATH = Path(__file__).with_name("quota_api.py")
 
@@ -43,6 +46,30 @@ def load_quota_api() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class PluginMetadataTests(unittest.TestCase):
+    def test_plugin_metadata_documents_v2_providers_and_config_surface(self) -> None:
+        plugin = load_plugin()
+        metadata = yaml.safe_load(PLUGIN_METADATA_PATH.read_text(encoding="utf-8"))
+
+        self.assertIsInstance(metadata, dict)
+        self.assertEqual(metadata["version"], "2.0.0")
+        description = metadata["description"]
+        for provider_display_name in ("Claude", "Codex", "Gemini", "GLM/Zhipu", "DeepSeek"):
+            self.assertIn(provider_display_name, description)
+
+        self.assertIn("quota_status.providers", description)
+        self.assertIn("case-sensitive provider names", description)
+        documented_provider_names = (
+            description.split("Valid case-sensitive provider names are ", 1)[1]
+            .rstrip(".")
+            .replace(", and ", ", ")
+            .split(", ")
+        )
+        self.assertEqual(tuple(documented_provider_names), plugin.PROVIDERS)
+
+        self.assertEqual(metadata["provides_hooks"], ["on_status_bar_render"])
 
 
 class QuotaApiDeepSeekTests(unittest.TestCase):
