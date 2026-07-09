@@ -1,5 +1,5 @@
 """
-Hermes Quota Status Plugin - displays Claude, Codex, and Gemini quota status.
+Hermes Quota Status Plugin - displays Claude, Codex, Gemini, GLM, and DeepSeek quota status.
 
 Uses tokens stored by each CLI/API integration to query quota APIs directly.
 Network refreshes run in a background thread so status bar rendering never
@@ -53,10 +53,16 @@ except ImportError:
         json_object,
     )
 
-ProviderName: TypeAlias = Literal["claude", "codex", "gemini"]
+ProviderName: TypeAlias = Literal["claude", "codex", "gemini", "glm", "deepseek"]
 
-PROVIDERS: Final[tuple[ProviderName, ...]] = ("claude", "codex", "gemini")
-PROVIDER_SHORT: Final[dict[ProviderName, str]] = {"claude": "C", "codex": "Cx", "gemini": "G"}
+PROVIDERS: Final[tuple[ProviderName, ...]] = ("claude", "codex", "gemini", "glm", "deepseek")
+PROVIDER_SHORT: Final[dict[ProviderName, str]] = {
+    "claude": "C",
+    "codex": "Cx",
+    "gemini": "Ge",
+    "glm": "GL",
+    "deepseek": "D",
+}
 THRESHOLD_WARN: Final[float] = 50.0
 THRESHOLD_CRITICAL: Final[float] = 80.0
 THRESHOLD_FULL: Final[float] = 100.0
@@ -67,6 +73,9 @@ AUTH_RETRY_TTL: Final[int] = 300
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ProviderName",
+    "PROVIDERS",
+    "PROVIDER_SHORT",
     "fetch_claude_quota",
     "fetch_codex_quota",
     "fetch_gemini_quota",
@@ -141,6 +150,8 @@ class CacheState(TypedDict):
     claude: ProviderQuota | None
     codex: ProviderQuota | None
     gemini: ProviderQuota | None
+    glm: ProviderQuota | None
+    deepseek: ProviderQuota | None
     ts: float
     refreshing: bool
     stale: set[ProviderName]
@@ -158,10 +169,12 @@ _cache: CacheState = {
     "claude": None,
     "codex": None,
     "gemini": None,
+    "glm": None,
+    "deepseek": None,
     "ts": 0.0,
     "refreshing": False,
     "stale": set(),
-    "next_retry": {"claude": 0.0, "codex": 0.0, "gemini": 0.0},
+    "next_retry": {provider: 0.0 for provider in PROVIDERS},
 }
 _cache_lock = threading.Lock()
 _last_errors: list[ProviderError] = []
@@ -556,7 +569,9 @@ def _refresh_cache(due_providers: tuple[ProviderName, ...] | None = None) -> Non
 
     try:
         for provider in due_providers:
-            fetcher = _PROVIDERS[provider]
+            fetcher = _PROVIDERS.get(provider)
+            if fetcher is None:
+                continue
             try:
                 result = fetcher()
             except urllib.error.HTTPError as exc:
@@ -715,16 +730,17 @@ def on_status_bar_render(snapshot=None, **kwargs) -> str | None:
         _start_refresh_if_needed()
         with _cache_lock:
             cache_snapshot = {
-                "claude": _cache["claude"],
-                "codex": _cache["codex"],
-                "gemini": _cache["gemini"],
+                **{provider: _cache[provider] for provider in PROVIDERS},
                 "stale": set(_cache["stale"]),
             }
 
-        parts = [
-            _render_provider(provider, cache_snapshot[provider], provider in cache_snapshot["stale"])
-            for provider in PROVIDERS
-        ]
+        parts = []
+        for provider in PROVIDERS:
+            data = cache_snapshot[provider]
+            is_stale = provider in cache_snapshot["stale"]
+            if provider not in _PROVIDERS and data is None and not is_stale:
+                continue
+            parts.append(_render_provider(provider, data, is_stale))
         return " │ ".join(parts)
     except Exception as exc:
         logger.warning(

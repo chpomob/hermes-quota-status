@@ -245,18 +245,19 @@ class HermesQuotaStatusTests(unittest.TestCase):
 
     def test_render_gemini_states(self) -> None:
         cases = [
-            (None, False, "🔴 G:?"),
-            ({"key_valid": False}, False, "🔴 G:KEY"),
-            ({"key_valid": True, "probe": {"status": 200}}, False, "🟢 G:OK"),
-            ({"key_valid": True, "probe": {"status": 429}}, False, "🔴 G:LIMIT"),
-            ({"key_valid": True, "probe": {"status": 403}}, False, "🟡 G:403"),
-            ({"key_valid": True, "probe": {"status": "error"}}, False, "🟡 G:ERR"),
-            ({"key_valid": True}, False, "🟢 G:KEY"),
+            (None, False, "🔴 Ge:?"),
+            ({"key_valid": False}, False, "🔴 Ge:KEY"),
+            ({"key_valid": True, "probe": {"status": 200}}, False, "🟢 Ge:OK"),
+            ({"key_valid": True, "probe": {"status": 429}}, False, "🔴 Ge:LIMIT"),
+            ({"key_valid": True, "probe": {"status": 403}}, False, "🟡 Ge:403"),
+            ({"key_valid": True, "probe": {"status": "error"}}, False, "🟡 Ge:ERR"),
+            ({"key_valid": True}, False, "🟢 Ge:KEY"),
         ]
 
         for data, stale, expected in cases:
             with self.subTest(data=data, stale=stale):
-                self.assertEqual(self.plugin._render_provider("gemini", data, stale), expected)
+                rendered = self.plugin._render_provider("gemini", data, stale)
+                self.assertEqual(rendered, expected)
 
     def test_render_gemini_cloudcode_percent_and_credits(self) -> None:
         reset = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat().replace("+00:00", "Z")
@@ -272,7 +273,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
                 },
                 False,
             ),
-            "🟢 G:40%",
+            "🟢 Ge:40%",
         )
         self.assertEqual(
             self.plugin._render_provider(
@@ -284,7 +285,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
                 },
                 False,
             ),
-            "🔴 G:100%",
+            "🔴 Ge:100%",
         )
         self.assertEqual(
             self.plugin._render_provider(
@@ -292,12 +293,28 @@ class HermesQuotaStatusTests(unittest.TestCase):
                 {"cloudcode": True, "prompt_credits": 600.0, "monthly_prompt_credits": 1500.0},
                 False,
             ),
-            "🟡 G:CREDITS 600/1500",
+            "🟡 Ge:CREDITS 600/1500",
         )
         self.assertEqual(
             self.plugin._render_provider("gemini", {"cloudcode": True, "cloudcode_error": "auth"}, False),
-            "🔴 G:AUTH",
+            "🔴 Ge:AUTH",
         )
+
+    def test_v2_provider_identity_order_and_cache_initialization(self) -> None:
+        expected = ("claude", "codex", "gemini", "glm", "deepseek")
+        active_fetchers = ("claude", "codex", "gemini")
+
+        self.assertEqual(self.plugin.PROVIDERS, expected)
+        self.assertEqual(tuple(self.plugin._PROVIDERS), active_fetchers)
+        self.assertEqual(self.plugin.PROVIDER_SHORT["gemini"], "Ge")
+        self.assertEqual(self.plugin.PROVIDER_SHORT["glm"], "GL")
+        self.assertEqual(self.plugin.PROVIDER_SHORT["deepseek"], "D")
+        for provider in expected:
+            self.assertIn(provider, self.plugin._cache)
+            self.assertIsNone(self.plugin._cache[provider])
+            self.assertEqual(self.plugin._cache["next_retry"][provider], 0.0)
+
+        self.assertEqual(self.plugin._due_providers(0.0), active_fetchers)
 
     def test_render_does_not_call_refresh_inline(self) -> None:
         with patch.object(self.plugin, "_refresh_cache", side_effect=AssertionError("sync refresh")), patch.object(
@@ -306,7 +323,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
             rendered = self.plugin.on_status_bar_render()
 
         start_refresh.assert_called_once_with()
-        self.assertEqual(rendered, "🔴 C:? │ 🔴 Cx:? │ 🔴 G:?")
+        self.assertEqual(rendered, "🔴 C:? │ 🔴 Cx:? │ 🔴 Ge:?")
 
     def test_render_catches_unexpected_exception(self) -> None:
         with patch.object(self.plugin, "_start_refresh_if_needed"), patch.object(
