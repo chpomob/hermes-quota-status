@@ -1038,8 +1038,214 @@ class HermesQuotaStatusTests(unittest.TestCase):
             self.assertIn(provider, self.plugin._cache)
             self.assertIsNone(self.plugin._cache[provider])
             self.assertEqual(self.plugin._cache["next_retry"][provider], 0.0)
+            self.assertEqual(self.plugin._auth_failure_counts[provider], 0)
 
         self.assertEqual(self.plugin._due_providers(0.0), active_fetchers)
+
+    def test_auth_failure_suppresses_provider_after_third_consecutive_failure(self) -> None:
+        auth_error = urllib.error.HTTPError("https://example.test", 401, "unauthorized", {}, None)
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"claude": MagicMock(side_effect=auth_error)},
+            clear=True,
+        ):
+            self.plugin._refresh_cache(("claude",))
+            self.assertEqual(self.plugin._auth_failure_counts["claude"], 1)
+            self.plugin._refresh_cache(("claude",))
+            self.assertEqual(self.plugin._auth_failure_counts["claude"], 2)
+            self.plugin._refresh_cache(("claude",))
+
+        self.assertEqual(self.plugin._auth_failure_counts["claude"], 3)
+        with patch.object(self.plugin, "_start_refresh_if_needed") as start_refresh:
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["claude"]}})
+
+        start_refresh.assert_called_once_with(("claude",))
+        self.assertIsNone(rendered)
+
+    def test_auth_failure_suppression_is_independent_per_provider(self) -> None:
+        auth_error = urllib.error.HTTPError("https://example.test", 403, "forbidden", {}, None)
+        self.plugin._cache["codex"] = {"session_pct": 12.0, "reset_iso": ""}
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"claude": MagicMock(side_effect=auth_error)},
+            clear=True,
+        ):
+            for _ in range(3):
+                self.plugin._refresh_cache(("claude",))
+
+        self.assertEqual(self.plugin._auth_failure_counts["claude"], 3)
+        self.assertEqual(self.plugin._auth_failure_counts["codex"], 0)
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["claude", "codex"]}})
+
+        self.assertEqual(rendered, "🟢 Cx:12%")
+
+    def test_non_auth_failures_leave_auth_failure_counter_unchanged(self) -> None:
+        errors = (
+            urllib.error.HTTPError("https://example.test", 500, "server error", {}, None),
+            urllib.error.URLError("network unavailable"),
+            TimeoutError("slow response"),
+            json.JSONDecodeError("bad json", "not-json", 0),
+            ValueError("malformed response"),
+        )
+
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                self.plugin._auth_failure_counts["claude"] = 2
+                with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+                    self.plugin._PROVIDERS,
+                    {"claude": MagicMock(side_effect=error)},
+                    clear=True,
+                ):
+                    self.plugin._refresh_cache(("claude",))
+
+                self.assertEqual(self.plugin._auth_failure_counts["claude"], 2)
+
+    def test_missing_credentials_reset_auth_failure_counter(self) -> None:
+        self.plugin._auth_failure_counts["claude"] = 2
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"claude": MagicMock(return_value=None)},
+            clear=True,
+        ):
+            self.plugin._refresh_cache(("claude",))
+
+        self.assertEqual(self.plugin._auth_failure_counts["claude"], 0)
+        self.assertIsNone(self.plugin._cache["claude"])
+        self.assertEqual(self.plugin._cache["next_retry"]["claude"], 200.0 + self.plugin.AUTH_RETRY_TTL)
+
+    def test_missing_credentials_unsuppress_previously_auth_failed_provider(self) -> None:
+        self.plugin._auth_failure_counts["gemini"] = self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"gemini": MagicMock(return_value=None)},
+            clear=True,
+        ):
+            self.plugin._refresh_cache(("gemini",))
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["gemini"]}})
+
+        self.assertEqual(self.plugin._auth_failure_counts["gemini"], 0)
+        self.assertEqual(rendered, "🔴 Ge:?")
+
+    def test_gemini_invalid_api_key_counts_toward_auth_suppression(self) -> None:
+        invalid_key_result = {
+            "key_valid": False,
+            "available_models": [],
+            "model_count": 0,
+            "probe": None,
+            "error": "HTTP Error 400: Bad Request",
+        }
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"gemini": MagicMock(return_value=invalid_key_result)},
+            clear=True,
+        ):
+            self.plugin._refresh_cache(("gemini",))
+            self.assertEqual(self.plugin._auth_failure_counts["gemini"], 1)
+            self.plugin._refresh_cache(("gemini",))
+            self.assertEqual(self.plugin._auth_failure_counts["gemini"], 2)
+            self.plugin._refresh_cache(("gemini",))
+
+        self.assertEqual(self.plugin._auth_failure_counts["gemini"], 3)
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["gemini"]}})
+
+        self.assertIsNone(rendered)
+
+    def test_gemini_cloudcode_forbidden_counts_toward_auth_suppression(self) -> None:
+        forbidden_result = {"cloudcode": True, "cloudcode_error": "forbidden"}
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"gemini": MagicMock(return_value=forbidden_result)},
+            clear=True,
+        ):
+            for _ in range(3):
+                self.plugin._refresh_cache(("gemini",))
+
+        self.assertEqual(self.plugin._auth_failure_counts["gemini"], 3)
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["gemini"]}})
+
+        self.assertIsNone(rendered)
+
+    def test_gemini_cloudcode_non_auth_errors_do_not_reset_auth_failure_counter(self) -> None:
+        for error in ("rate_limited", "unknown", "KeyError"):
+            with self.subTest(error=error):
+                self.plugin._auth_failure_counts["gemini"] = 2
+
+                with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+                    self.plugin._PROVIDERS,
+                    {"gemini": MagicMock(return_value={"cloudcode": True, "cloudcode_error": error})},
+                    clear=True,
+                ):
+                    self.plugin._refresh_cache(("gemini",))
+
+                self.assertEqual(self.plugin._auth_failure_counts["gemini"], 2)
+
+    def test_successful_authenticated_check_resets_auth_failure_counter(self) -> None:
+        self.plugin._auth_failure_counts["claude"] = 2
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"claude": MagicMock(return_value={"session_pct": 18.0, "reset_iso": ""})},
+            clear=True,
+        ):
+            self.plugin._refresh_cache(("claude",))
+
+        self.assertEqual(self.plugin._auth_failure_counts["claude"], 0)
+        self.assertEqual(self.plugin._cache["claude"], {"session_pct": 18.0, "reset_iso": ""})
+        self.assertNotIn("claude", self.plugin._cache["stale"])
+
+    def test_suppressed_provider_is_still_scheduled_from_render(self) -> None:
+        self.plugin._auth_failure_counts["claude"] = self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD
+        self.plugin._cache["claude"] = {"session_pct": 18.0, "reset_iso": ""}
+
+        with patch.object(self.plugin, "_start_refresh_if_needed") as start_refresh:
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["claude"]}})
+
+        start_refresh.assert_called_once_with(("claude",))
+        self.assertIsNone(rendered)
+
+    def test_suppressed_provider_is_fetched_on_later_refreshes(self) -> None:
+        fetcher = MagicMock(return_value={"session_pct": 18.0, "reset_iso": ""})
+        self.plugin._auth_failure_counts["claude"] = self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD
+        self.plugin._cache["next_retry"]["claude"] = 0.0
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"claude": fetcher},
+            clear=True,
+        ):
+            self.plugin._refresh_cache()
+
+        fetcher.assert_called_once_with()
+        self.assertEqual(self.plugin._auth_failure_counts["claude"], 0)
+
+    def test_suppression_recovery_renders_provider_after_successful_refresh(self) -> None:
+        self.plugin._auth_failure_counts["claude"] = self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD
+        self.plugin._cache["claude"] = None
+        self.plugin._cache["stale"].add("claude")
+
+        with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"claude": MagicMock(return_value={"session_pct": 18.0, "reset_iso": ""})},
+            clear=True,
+        ):
+            self.plugin._refresh_cache(("claude",))
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["claude"]}})
+
+        self.assertEqual(self.plugin._auth_failure_counts["claude"], 0)
+        self.assertEqual(rendered, "🟢 C:18%")
 
     def test_render_reads_provider_allowlist_from_snapshot_config(self) -> None:
         self._seed_all_provider_cache()

@@ -97,6 +97,17 @@ THRESHOLD_FULL: Final[float] = 100.0
 CACHE_TTL: Final[int] = 120
 ERROR_RETRY_TTL: Final[int] = 30
 AUTH_RETRY_TTL: Final[int] = 300
+AUTH_FAILURE_SUPPRESSION_THRESHOLD: Final[int] = 3
+GEMINI_AUTH_ERROR_STRINGS: Final[tuple[str, ...]] = (
+    "api key",
+    "bad request",
+    "forbidden",
+    "http error 400",
+    "http error 401",
+    "http error 403",
+    "permission",
+    "unauthorized",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +249,7 @@ _cache: CacheState = {
 }
 _cache_lock = threading.Lock()
 _last_errors: list[ProviderError] = []
+_auth_failure_counts: dict[ProviderName, int] = {provider: 0 for provider in PROVIDERS}
 
 QUOTA_WINDOW_SPECS: Final[dict[ProviderName, tuple[QuotaWindowSpec, ...]]] = {
     "claude": (
@@ -642,6 +654,50 @@ def _retry_ttl(error_type: str) -> int:
     return AUTH_RETRY_TTL if error_type in {"auth", "missing_token"} else ERROR_RETRY_TTL
 
 
+def _record_auth_failure(provider: ProviderName) -> None:
+    _auth_failure_counts[provider] = _auth_failure_counts.get(provider, 0) + 1
+
+
+def _reset_auth_failures(provider: ProviderName) -> None:
+    _auth_failure_counts[provider] = 0
+
+
+def _provider_auth_suppressed(provider: ProviderName, auth_failure_counts: Mapping[ProviderName, int]) -> bool:
+    return auth_failure_counts.get(provider, 0) >= AUTH_FAILURE_SUPPRESSION_THRESHOLD
+
+
+def _provider_result_auth_error_type(provider: ProviderName, result: ProviderQuota) -> str | None:
+    if provider != "gemini":
+        return None
+
+    if result.get("cloudcode") is True:
+        error = result.get("cloudcode_error")
+        if error in {"auth", "forbidden"}:
+            return "auth"
+        if error == "missing_token":
+            return "missing_token"
+        return None
+
+    if result.get("key_valid") is False:
+        error = result.get("error")
+        if not isinstance(error, str):
+            return None
+        normalized_error = error.lower()
+        if any(auth_error in normalized_error for auth_error in GEMINI_AUTH_ERROR_STRINGS):
+            return "auth"
+    return None
+
+
+def _provider_result_is_authenticated_success(provider: ProviderName, result: ProviderQuota) -> bool:
+    if provider == "gemini":
+        if result.get("cloudcode_error") is not None:
+            return False
+        if result.get("cloudcode") is True:
+            return True
+        return result.get("key_valid") is True
+    return True
+
+
 def _due_providers(now: float, providers: tuple[ProviderName, ...] = PROVIDERS) -> tuple[ProviderName, ...]:
     return tuple(
         provider
@@ -670,7 +726,11 @@ def _mark_provider_error(provider: ProviderName, error_type: str, *, http_status
         _record_error(error)
         _cache["ts"] = now
         _cache["stale"].add(provider)
-        if error_type in {"auth", "missing_token"}:
+        if error_type == "auth":
+            _record_auth_failure(provider)
+            _cache[provider] = None
+        elif error_type == "missing_token":
+            _reset_auth_failures(provider)
             _cache[provider] = None
         _cache["next_retry"][provider] = now + _retry_ttl(error_type)
 
@@ -684,11 +744,27 @@ def _store_provider_result(provider: ProviderName, result: ProviderQuota | None)
         if result is None:
             _cache[provider] = None
             _cache["stale"].add(provider)
+            _reset_auth_failures(provider)
             _cache["next_retry"][provider] = now + AUTH_RETRY_TTL
         else:
             _cache[provider] = result
             _cache["stale"].discard(provider)
-            _cache["next_retry"][provider] = now + CACHE_TTL
+            result_error_type = _provider_result_auth_error_type(provider, result)
+            if result_error_type == "auth":
+                _record_error({"provider": provider, "type": "auth", "timestamp": now})
+                _record_auth_failure(provider)
+                _cache["next_retry"][provider] = now + AUTH_RETRY_TTL
+            elif result_error_type == "missing_token":
+                _record_error({"provider": provider, "type": "missing_token", "timestamp": now})
+                _reset_auth_failures(provider)
+                _cache[provider] = None
+                _cache["stale"].add(provider)
+                _cache["next_retry"][provider] = now + AUTH_RETRY_TTL
+            elif _provider_result_is_authenticated_success(provider, result):
+                _reset_auth_failures(provider)
+                _cache["next_retry"][provider] = now + CACHE_TTL
+            else:
+                _cache["next_retry"][provider] = now + CACHE_TTL
 
 
 def _refresh_cache(due_providers: tuple[ProviderName, ...] | None = None) -> None:
@@ -1185,15 +1261,21 @@ def on_status_bar_render(snapshot=None, **kwargs) -> str | None:
             cache_snapshot = {
                 **{provider: _cache[provider] for provider in render_providers},
                 "stale": set(_cache["stale"]),
+                "auth_failure_counts": dict(_auth_failure_counts),
             }
 
         parts = []
+        auth_failure_counts = cast(Mapping[ProviderName, int], cache_snapshot["auth_failure_counts"])
         for provider in render_providers:
+            if _provider_auth_suppressed(provider, auth_failure_counts):
+                continue
             data = cache_snapshot[provider]
             is_stale = provider in cache_snapshot["stale"]
             if provider not in _PROVIDERS and data is None and not is_stale:
                 continue
             parts.append(_render_provider(provider, data, is_stale))
+        if not parts:
+            return None
         return _trim_status_parts_for_width(parts, terminal_width)
     except Exception as exc:
         logger.warning(
