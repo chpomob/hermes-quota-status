@@ -19,7 +19,7 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict
+from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, cast
 
 try:
     from . import gemini_cloudcode
@@ -32,6 +32,7 @@ try:
         get_codex_token,
         get_gemini_key,
         json_number,
+        json_number_or_none,
         json_object,
     )
 except ImportError:
@@ -50,10 +51,12 @@ except ImportError:
         get_codex_token,
         get_gemini_key,
         json_number,
+        json_number_or_none,
         json_object,
     )
 
 ProviderName: TypeAlias = Literal["claude", "codex", "gemini", "glm", "deepseek"]
+QuotaWindowKey: TypeAlias = Literal["session", "weekly"]
 
 PROVIDERS: Final[tuple[ProviderName, ...]] = ("claude", "codex", "gemini", "glm", "deepseek")
 PROVIDER_SHORT: Final[dict[ProviderName, str]] = {
@@ -128,9 +131,28 @@ class GroupInfo(TypedDict, total=False):
     model_count: int
 
 
+class QuotaWindowInfo(TypedDict, total=False):
+    name: str
+    label: str
+    pct: float
+    reset_iso: str
+
+
+class QuotaWindowSpec(TypedDict):
+    key: QuotaWindowKey
+    pct_key: str
+    reset_key: str
+    name: str
+    label: str
+
+
 class ProviderQuota(TypedDict, total=False):
     session_pct: float
     reset_iso: str
+    session_reset: str
+    weekly_pct: float
+    weekly_reset: str
+    windows: list[QuotaWindowInfo]
     cloudcode: bool
     cloudcode_error: str
     agy_scrape: bool
@@ -179,29 +201,83 @@ _cache: CacheState = {
 _cache_lock = threading.Lock()
 _last_errors: list[ProviderError] = []
 
+QUOTA_WINDOW_SPECS: Final[dict[ProviderName, tuple[QuotaWindowSpec, ...]]] = {
+    "claude": (
+        {"key": "session", "pct_key": "session_pct", "reset_key": "session_reset", "name": "five_hour", "label": "5h"},
+        {"key": "weekly", "pct_key": "weekly_pct", "reset_key": "weekly_reset", "name": "seven_day", "label": "7d"},
+    ),
+    "codex": (
+        {"key": "session", "pct_key": "session_pct", "reset_key": "session_reset", "name": "primary", "label": "P"},
+        {"key": "weekly", "pct_key": "weekly_pct", "reset_key": "weekly_reset", "name": "secondary", "label": "S"},
+    ),
+}
+
 
 def _quota_pct(value: Any) -> float:
     return max(0.0, min(json_number(value), 100.0))
+
+
+def _quota_pct_or_none(value: Any) -> float | None:
+    number = json_number_or_none(value)
+    if number is None:
+        return None
+    return max(0.0, min(number, 100.0))
+
+
+def _quota_reset(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _make_quota_window(
+    data: dict[str, Any],
+    pct_key: str,
+    reset_key: str,
+    name: str,
+    label: str,
+) -> QuotaWindowInfo | None:
+    pct = _quota_pct_or_none(data.get(pct_key))
+    if pct is None:
+        return None
+    return {
+        "name": name,
+        "label": label,
+        "pct": pct,
+        "reset_iso": _quota_reset(data.get(reset_key)),
+    }
+
+
+def _shared_window_quota(data: dict[str, Any], window_specs: tuple[QuotaWindowSpec, ...]) -> ProviderQuota:
+    result: dict[str, Any] = {}
+    windows: list[QuotaWindowInfo] = []
+
+    for spec in window_specs:
+        window = _make_quota_window(data, spec["pct_key"], spec["reset_key"], spec["name"], spec["label"])
+        if window is None:
+            continue
+        windows.append(window)
+        result[spec["pct_key"]] = window["pct"]
+        result[spec["reset_key"]] = window.get("reset_iso", "")
+        if spec["key"] == "session":
+            result["reset_iso"] = window.get("reset_iso", "")
+
+    if windows:
+        result["windows"] = windows
+        result.setdefault("reset_iso", "")
+    return cast(ProviderQuota, result)
 
 
 def _fetch_claude() -> ProviderQuota | None:
     data = fetch_claude_quota()
     if data is None:
         return None
-    return {
-        "session_pct": _quota_pct(data.get("session_pct")),
-        "reset_iso": data.get("session_reset") if isinstance(data.get("session_reset"), str) else "",
-    }
+    return _shared_window_quota(data, QUOTA_WINDOW_SPECS["claude"])
 
 
 def _fetch_codex() -> ProviderQuota | None:
     data = fetch_codex_quota()
     if data is None:
         return None
-    return {
-        "session_pct": _quota_pct(data.get("session_pct")),
-        "reset_iso": data.get("session_reset") if isinstance(data.get("session_reset"), str) else "",
-    }
+    return _shared_window_quota(data, QUOTA_WINDOW_SPECS["codex"])
 
 
 def _short_model_name(model_id: str) -> str:
@@ -701,6 +777,78 @@ def _render_gemini(data: ProviderQuota | None, is_stale: bool) -> str:
     return f"🟡 {short}:{int(json_number(status))}"
 
 
+def _fallback_quota_window_label(provider: ProviderName, key: QuotaWindowKey) -> str:
+    for spec in QUOTA_WINDOW_SPECS.get(provider, ()):
+        if spec["key"] == key:
+            return spec["label"]
+    return ""
+
+
+def _quota_window_from_values(label: str, pct_value: Any, reset_value: Any) -> QuotaWindowInfo | None:
+    pct = _quota_pct_or_none(pct_value)
+    if pct is None:
+        return None
+    return {"label": label, "pct": pct, "reset_iso": _quota_reset(reset_value)}
+
+
+def _quota_windows_for_render(provider: ProviderName, data: ProviderQuota) -> tuple[list[QuotaWindowInfo], bool]:
+    raw_windows = data.get("windows")
+    if isinstance(raw_windows, list):
+        windows: list[QuotaWindowInfo] = []
+        for raw_window in raw_windows:
+            if not isinstance(raw_window, dict):
+                continue
+            label = raw_window.get("label")
+            if not isinstance(label, str) or not label:
+                continue
+            window = _quota_window_from_values(
+                label,
+                raw_window.get("pct"),
+                raw_window.get("reset_iso"),
+            )
+            if window is None:
+                continue
+            name = raw_window.get("name")
+            if isinstance(name, str):
+                window["name"] = name
+            windows.append(window)
+        return windows, True
+
+    windows = []
+    session_window = _quota_window_from_values(
+        _fallback_quota_window_label(provider, "session"),
+        data.get("session_pct"),
+        data.get("reset_iso") or data.get("session_reset"),
+    )
+    if session_window is not None:
+        windows.append(session_window)
+
+    weekly_window = _quota_window_from_values(
+        _fallback_quota_window_label(provider, "weekly"),
+        data.get("weekly_pct"),
+        data.get("weekly_reset"),
+    )
+    if weekly_window is not None:
+        windows.append(weekly_window)
+
+    return windows, False
+
+
+def _render_quota_window(window: QuotaWindowInfo, include_label: bool) -> str:
+    pct = _quota_pct(window.get("pct"))
+    value = "FULL" if pct >= THRESHOLD_FULL else _fmt_pct(pct)
+    if pct >= THRESHOLD_CRITICAL:
+        reset_iso = window.get("reset_iso", "")
+        reset = _fmt_reset(reset_iso) if isinstance(reset_iso, str) and reset_iso else ""
+        if reset and reset != "?":
+            value = f"{value} {reset}"
+
+    label = window.get("label") if isinstance(window.get("label"), str) else ""
+    if include_label and label:
+        return f"{label}:{value}"
+    return value
+
+
 def _render_provider(provider: ProviderName, data: ProviderQuota | None, is_stale: bool) -> str:
     if provider == "gemini":
         return _render_gemini(data, is_stale)
@@ -708,19 +856,21 @@ def _render_provider(provider: ProviderName, data: ProviderQuota | None, is_stal
     short = PROVIDER_SHORT[provider]
     if data is None or is_stale:
         return f"🔴 {short}:?"
-    if data.get("session_pct") is None:
+    windows, has_explicit_windows = _quota_windows_for_render(provider, data)
+    if not windows:
         return f"🟡 {short}:?"
 
-    pct = _quota_pct(data.get("session_pct"))
-    reset = _fmt_reset(data.get("reset_iso", ""))
+    worst_pct = max(_quota_pct(window.get("pct")) for window in windows)
+    include_labels = has_explicit_windows or len(windows) > 1 or (
+        len(windows) == 1 and data.get("session_pct") is None and data.get("weekly_pct") is not None
+    )
+    rendered_windows = " ".join(_render_quota_window(window, include_labels) for window in windows)
 
-    if pct >= THRESHOLD_FULL:
-        return f"🔴 {short}:FULL {reset}"
-    if pct >= THRESHOLD_CRITICAL:
-        return f"🟡 {short}:{_fmt_pct(pct)} {reset}"
-    if pct >= THRESHOLD_WARN:
-        return f"🟡 {short}:{_fmt_pct(pct)}"
-    return f"🟢 {short}:{_fmt_pct(pct)}"
+    if worst_pct >= THRESHOLD_FULL:
+        return f"🔴 {short}:{rendered_windows}"
+    if worst_pct >= THRESHOLD_WARN:
+        return f"🟡 {short}:{rendered_windows}"
+    return f"🟢 {short}:{rendered_windows}"
 
 
 def on_status_bar_render(snapshot=None, **kwargs) -> str | None:

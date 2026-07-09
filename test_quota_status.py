@@ -159,6 +159,73 @@ class QuotaApiDeepSeekTests(unittest.TestCase):
                     self.quota_api.fetch_deepseek_balance()
 
 
+class QuotaApiClaudeCodexWindowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.quota_api = load_quota_api()
+
+    def test_fetch_claude_quota_preserves_dual_windows(self) -> None:
+        with patch.object(self.quota_api, "get_claude_token", return_value="claude-token"), patch.object(
+            self.quota_api,
+            "fetch_json",
+            return_value={
+                "five_hour": {"utilization": "18", "resets_at": "2026-06-02T18:10:00Z"},
+                "seven_day": {"utilization": 57, "resets_at": "2026-06-08T18:10:00Z"},
+            },
+        ):
+            result = self.quota_api.fetch_claude_quota()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["session_pct"], 18.0)
+        self.assertEqual(result["session_reset"], "2026-06-02T18:10:00Z")
+        self.assertEqual(result["weekly_pct"], 57.0)
+        self.assertEqual(result["weekly_reset"], "2026-06-08T18:10:00Z")
+
+    def test_fetch_claude_quota_omits_missing_window(self) -> None:
+        with patch.object(self.quota_api, "get_claude_token", return_value="claude-token"), patch.object(
+            self.quota_api,
+            "fetch_json",
+            return_value={"seven_day": {"utilization": 57, "resets_at": "2026-06-08T18:10:00Z"}},
+        ):
+            result = self.quota_api.fetch_claude_quota()
+
+        self.assertIsNotNone(result)
+        self.assertNotIn("session_pct", result)
+        self.assertNotIn("session_reset", result)
+        self.assertEqual(result["weekly_pct"], 57.0)
+
+    def test_fetch_codex_quota_preserves_dual_windows(self) -> None:
+        with patch.object(self.quota_api, "get_codex_token", return_value="codex-token"), patch.object(
+            self.quota_api,
+            "fetch_json",
+            return_value={
+                "rate_limit": {
+                    "primary_window": {"used_percent": "12", "reset_at": 1777819631},
+                    "secondary_window": {"used_percent": 48, "reset_at": 1778262784},
+                }
+            },
+        ):
+            result = self.quota_api.fetch_codex_quota()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["session_pct"], 12.0)
+        self.assertEqual(result["session_reset"], "2026-05-03T14:47:11Z")
+        self.assertEqual(result["weekly_pct"], 48.0)
+        self.assertEqual(result["weekly_reset"], "2026-05-08T17:53:04Z")
+
+    def test_fetch_codex_quota_omits_missing_window(self) -> None:
+        with patch.object(self.quota_api, "get_codex_token", return_value="codex-token"), patch.object(
+            self.quota_api,
+            "fetch_json",
+            return_value={"rate_limit": {"secondary_window": {"used_percent": 48, "reset_at": 1778262784}}},
+        ):
+            result = self.quota_api.fetch_codex_quota()
+
+        self.assertIsNotNone(result)
+        self.assertNotIn("session_pct", result)
+        self.assertNotIn("session_reset", result)
+        self.assertEqual(result["weekly_pct"], 48.0)
+
+
 class QuotaApiGlmTests(unittest.TestCase):
     def setUp(self) -> None:
         self.quota_api = load_quota_api()
@@ -393,7 +460,8 @@ class HermesQuotaStatusTests(unittest.TestCase):
             result = self.plugin._fetch_codex()
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["session_pct"], 0.0)
+        self.assertNotIn("session_pct", result)
+        self.assertEqual(result["weekly_pct"], 0.0)
         self.assertEqual(result["reset_iso"], "")
 
     def test_fetch_claude_does_not_inflate_percent_utilization(self) -> None:
@@ -407,6 +475,121 @@ class HermesQuotaStatusTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["session_pct"], 1.0)
         self.assertEqual(result["reset_iso"], "2026-06-02T18:10:00Z")
+
+    def test_fetch_claude_preserves_dual_windows_for_rendering(self) -> None:
+        with patch.object(
+            self.plugin,
+            "fetch_claude_quota",
+            return_value={
+                "session_pct": 24.0,
+                "session_reset": "2026-06-02T18:10:00Z",
+                "weekly_pct": 61.0,
+                "weekly_reset": "2026-06-08T18:10:00Z",
+            },
+        ):
+            result = self.plugin._fetch_claude()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["session_pct"], 24.0)
+        self.assertEqual(result["weekly_pct"], 61.0)
+        self.assertEqual(
+            result["windows"],
+            [
+                {"name": "five_hour", "label": "5h", "pct": 24.0, "reset_iso": "2026-06-02T18:10:00Z"},
+                {"name": "seven_day", "label": "7d", "pct": 61.0, "reset_iso": "2026-06-08T18:10:00Z"},
+            ],
+        )
+        rendered = self.plugin._render_provider("claude", result, False)
+        self.assertIn("5h:24%", rendered)
+        self.assertIn("7d:61%", rendered)
+
+    def test_fetch_claude_preserves_five_hour_only_window_for_rendering(self) -> None:
+        with patch.object(
+            self.plugin,
+            "fetch_claude_quota",
+            return_value={"session_pct": 23.0, "session_reset": "2026-06-02T18:10:00Z"},
+        ):
+            result = self.plugin._fetch_claude()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["session_pct"], 23.0)
+        self.assertNotIn("weekly_pct", result)
+        rendered = self.plugin._render_provider("claude", result, False)
+        self.assertIn("5h:23%", rendered)
+        self.assertNotIn("7d", rendered)
+
+    def test_fetch_claude_preserves_seven_day_only_window_for_rendering(self) -> None:
+        with patch.object(
+            self.plugin,
+            "fetch_claude_quota",
+            return_value={"weekly_pct": 64.0, "weekly_reset": "2026-06-08T18:10:00Z"},
+        ):
+            result = self.plugin._fetch_claude()
+
+        self.assertIsNotNone(result)
+        self.assertNotIn("session_pct", result)
+        self.assertEqual(result["weekly_pct"], 64.0)
+        self.assertEqual(result["reset_iso"], "")
+        rendered = self.plugin._render_provider("claude", result, False)
+        self.assertIn("7d:64%", rendered)
+        self.assertNotIn("5h", rendered)
+
+    def test_fetch_codex_preserves_dual_windows_for_rendering(self) -> None:
+        with patch.object(
+            self.plugin,
+            "fetch_codex_quota",
+            return_value={
+                "session_pct": 22.0,
+                "session_reset": "2026-06-02T18:10:00Z",
+                "weekly_pct": 63.0,
+                "weekly_reset": "2026-06-08T18:10:00Z",
+            },
+        ):
+            result = self.plugin._fetch_codex()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["session_pct"], 22.0)
+        self.assertEqual(result["weekly_pct"], 63.0)
+        self.assertEqual(
+            result["windows"],
+            [
+                {"name": "primary", "label": "P", "pct": 22.0, "reset_iso": "2026-06-02T18:10:00Z"},
+                {"name": "secondary", "label": "S", "pct": 63.0, "reset_iso": "2026-06-08T18:10:00Z"},
+            ],
+        )
+        rendered = self.plugin._render_provider("codex", result, False)
+        self.assertIn("P:22%", rendered)
+        self.assertIn("S:63%", rendered)
+
+    def test_fetch_codex_preserves_primary_only_window_for_rendering(self) -> None:
+        with patch.object(
+            self.plugin,
+            "fetch_codex_quota",
+            return_value={"session_pct": 32.0, "session_reset": "2026-06-02T18:10:00Z"},
+        ):
+            result = self.plugin._fetch_codex()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["session_pct"], 32.0)
+        self.assertNotIn("weekly_pct", result)
+        rendered = self.plugin._render_provider("codex", result, False)
+        self.assertIn("P:32%", rendered)
+        self.assertNotIn("S:", rendered)
+
+    def test_fetch_codex_preserves_secondary_only_window_for_rendering(self) -> None:
+        with patch.object(
+            self.plugin,
+            "fetch_codex_quota",
+            return_value={"weekly_pct": 41.0, "weekly_reset": "2026-06-08T18:10:00Z"},
+        ):
+            result = self.plugin._fetch_codex()
+
+        self.assertIsNotNone(result)
+        self.assertNotIn("session_pct", result)
+        self.assertEqual(result["weekly_pct"], 41.0)
+        rendered = self.plugin._render_provider("codex", result, False)
+        self.assertIn("S:41%", rendered)
+        self.assertNotIn("P:", rendered)
 
     def test_fetch_gemini_maps_probe_shape(self) -> None:
         with patch.object(self.plugin, "_fetch_gemini_agy", return_value=None), patch.object(
@@ -563,14 +746,32 @@ class HermesQuotaStatusTests(unittest.TestCase):
             ({"session_pct": 49.9, "reset_iso": ""}, False, "🟢 C:49%"),
             ({"session_pct": 50.0, "reset_iso": ""}, False, "🟡 C:50%"),
             ({"session_pct": 79.9, "reset_iso": ""}, False, "🟡 C:79%"),
-            ({"session_pct": 80.0, "reset_iso": ""}, False, "🟡 C:80% ?"),
-            ({"session_pct": 99.9, "reset_iso": ""}, False, "🟡 C:99% ?"),
-            ({"session_pct": 100.0, "reset_iso": ""}, False, "🔴 C:FULL ?"),
+            ({"session_pct": 80.0, "reset_iso": ""}, False, "🟡 C:80%"),
+            ({"session_pct": 99.9, "reset_iso": ""}, False, "🟡 C:99%"),
+            ({"session_pct": 100.0, "reset_iso": ""}, False, "🔴 C:FULL"),
         ]
 
         for data, stale, expected in cases:
             with self.subTest(data=data, stale=stale):
                 self.assertEqual(self.plugin._render_provider("claude", data, stale), expected)
+
+    def test_render_provider_omits_missing_reset_for_explicit_windows(self) -> None:
+        rendered = self.plugin._render_provider(
+            "claude",
+            {"windows": [{"label": "5h", "pct": 100.0, "reset_iso": ""}, {"label": "7d", "pct": 30.0}]},
+            False,
+        )
+
+        self.assertEqual(rendered, "🔴 C:5h:FULL 7d:30%")
+
+    def test_render_provider_drops_unlabeled_explicit_windows(self) -> None:
+        rendered = self.plugin._render_provider(
+            "claude",
+            {"windows": [{"pct": 20}, {"label": 12, "pct": 30}]},
+            False,
+        )
+
+        self.assertEqual(rendered, "🟡 C:?")
 
     def test_render_gemini_states(self) -> None:
         cases = [

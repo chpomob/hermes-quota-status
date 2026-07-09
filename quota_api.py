@@ -414,12 +414,19 @@ def fetch_claude_quota() -> dict[str, Any] | None:
     data = fetch_json(req)
     five_hour = json_object(data.get("five_hour"))
     seven_day = json_object(data.get("seven_day"))
-    return {
-        "session_pct": _clamp_pct(five_hour.get("utilization")),
-        "session_reset": five_hour.get("resets_at") if isinstance(five_hour.get("resets_at"), str) else "",
-        "weekly_pct": _clamp_pct(seven_day.get("utilization")),
-        "weekly_reset": seven_day.get("resets_at") if isinstance(seven_day.get("resets_at"), str) else "",
-    }
+    result: dict[str, Any] = {}
+
+    session_pct = _percent_or_none(five_hour.get("utilization"))
+    if session_pct is not None:
+        result["session_pct"] = session_pct
+        result["session_reset"] = five_hour.get("resets_at") if isinstance(five_hour.get("resets_at"), str) else ""
+
+    weekly_pct = _percent_or_none(seven_day.get("utilization"))
+    if weekly_pct is not None:
+        result["weekly_pct"] = weekly_pct
+        result["weekly_reset"] = seven_day.get("resets_at") if isinstance(seven_day.get("resets_at"), str) else ""
+
+    return result
 
 
 def fetch_codex_quota() -> dict[str, Any] | None:
@@ -435,12 +442,19 @@ def fetch_codex_quota() -> dict[str, Any] | None:
     rate_limit = json_object(data.get("rate_limit"))
     primary_window = json_object(rate_limit.get("primary_window"))
     secondary_window = json_object(rate_limit.get("secondary_window"))
-    return {
-        "session_pct": _clamp_pct(primary_window.get("used_percent")),
-        "session_reset": _epoch_to_iso(primary_window.get("reset_at")),
-        "weekly_pct": _clamp_pct(secondary_window.get("used_percent")),
-        "weekly_reset": _epoch_to_iso(secondary_window.get("reset_at")),
-    }
+    result: dict[str, Any] = {}
+
+    primary_pct = _percent_or_none(primary_window.get("used_percent"))
+    if primary_pct is not None:
+        result["session_pct"] = primary_pct
+        result["session_reset"] = _epoch_to_iso(primary_window.get("reset_at"))
+
+    secondary_pct = _percent_or_none(secondary_window.get("used_percent"))
+    if secondary_pct is not None:
+        result["weekly_pct"] = secondary_pct
+        result["weekly_reset"] = _epoch_to_iso(secondary_window.get("reset_at"))
+
+    return result
 
 
 def fetch_gemini_quota() -> dict[str, Any] | None:
