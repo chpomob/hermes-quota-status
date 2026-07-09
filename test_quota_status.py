@@ -45,6 +45,120 @@ def load_quota_api() -> ModuleType:
     return module
 
 
+class QuotaApiDeepSeekTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.quota_api = load_quota_api()
+
+    def test_get_deepseek_key_returns_none_when_unset_or_empty(self) -> None:
+        for env in ({}, {"DEEPSEEK_API_KEY": ""}):
+            with self.subTest(env=env), patch.dict(self.quota_api.os.environ, env, clear=True):
+                self.assertIsNone(self.quota_api.get_deepseek_key())
+
+    def test_fetch_deepseek_balance_missing_credentials_returns_none(self) -> None:
+        with patch.dict(self.quota_api.os.environ, {}, clear=True), patch.object(
+            self.quota_api, "fetch_json"
+        ) as fetch_json:
+            self.assertIsNone(self.quota_api.fetch_deepseek_balance())
+
+        fetch_json.assert_not_called()
+
+    def test_fetch_deepseek_balance_success_normalizes_balance_shape(self) -> None:
+        with patch.dict(self.quota_api.os.environ, {"DEEPSEEK_API_KEY": "deepseek-raw"}, clear=True), patch.object(
+            self.quota_api,
+            "fetch_json",
+            return_value={
+                "is_available": True,
+                "balance_infos": [
+                    {
+                        "currency": "CNY",
+                        "total_balance": "110.00",
+                        "granted_balance": "10.00",
+                        "topped_up_balance": "100.00",
+                    }
+                ],
+            },
+        ):
+            result = self.quota_api.fetch_deepseek_balance()
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["is_available"])
+        self.assertEqual(result["currency"], "CNY")
+        self.assertEqual(result["balance"], 110.0)
+        self.assertEqual(result["total_balance"], 110.0)
+        self.assertEqual(result["granted_balance"], 10.0)
+        self.assertEqual(result["topped_up_balance"], 100.0)
+        self.assertEqual(result["total_balance_display"], "110.00")
+        self.assertEqual(
+            result["balances"],
+            [
+                {
+                    "currency": "CNY",
+                    "total_balance": 110.0,
+                    "total_balance_display": "110.00",
+                    "granted_balance": 10.0,
+                    "granted_balance_display": "10.00",
+                    "topped_up_balance": 100.0,
+                    "topped_up_balance_display": "100.00",
+                }
+            ],
+        )
+
+    def test_fetch_deepseek_balance_uses_exact_url_and_bearer_authorization(self) -> None:
+        requests = []
+
+        def fake_fetch(req):
+            requests.append(req)
+            return {
+                "is_available": True,
+                "balance_infos": [{"currency": "USD", "total_balance": "3.50"}],
+            }
+
+        with patch.dict(self.quota_api.os.environ, {"DEEPSEEK_API_KEY": "sk-test"}, clear=True), patch.object(
+            self.quota_api, "fetch_json", side_effect=fake_fetch
+        ):
+            self.quota_api.fetch_deepseek_balance()
+
+        self.assertEqual(requests[0].full_url, "https://api.deepseek.com/user/balance")
+        self.assertEqual(requests[0].get_header("Authorization"), "Bearer sk-test")
+
+    def test_fetch_deepseek_balance_defensively_parses_amounts_and_currency(self) -> None:
+        with patch.dict(self.quota_api.os.environ, {"DEEPSEEK_API_KEY": "sk-test"}, clear=True), patch.object(
+            self.quota_api,
+            "fetch_json",
+            return_value={
+                "is_available": "yes",
+                "balance_infos": [
+                    {"currency": "CNY", "total_balance": {"value": "7.25"}},
+                    {"currency": 123, "total_balance": {"amount": "bad"}, "granted_balance": {"amount": "1.25"}},
+                    "ignored",
+                    {"currency": "USD", "total_balance": {"amount": "2.50"}, "topped_up_balance": "2.00"},
+                ],
+            },
+        ):
+            result = self.quota_api.fetch_deepseek_balance()
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result["is_available"])
+        self.assertEqual(result["currency"], "USD")
+        self.assertEqual(result["balance"], 2.5)
+        self.assertEqual(result["total_balance_display"], "2.50")
+        self.assertEqual(result["topped_up_balance"], 2.0)
+        self.assertEqual(result["balances"][1]["currency"], "")
+        self.assertEqual(result["balances"][1]["granted_balance"], 1.25)
+
+    def test_fetch_deepseek_balance_malformed_authenticated_response_raises_value_error(self) -> None:
+        cases = (
+            {"is_available": True},
+            {"is_available": True, "balance_infos": [{"currency": "USD", "total_balance": "n/a"}]},
+        )
+        for payload in cases:
+            with self.subTest(payload=payload), patch.dict(
+                self.quota_api.os.environ, {"DEEPSEEK_API_KEY": "sk-test"}, clear=True
+            ), patch.object(self.quota_api, "fetch_json", return_value=payload):
+                with self.assertRaises(ValueError):
+                    self.quota_api.fetch_deepseek_balance()
+
+
 class QuotaApiGlmTests(unittest.TestCase):
     def setUp(self) -> None:
         self.quota_api = load_quota_api()

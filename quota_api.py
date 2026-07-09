@@ -1,4 +1,4 @@
-"""Shared quota API client for Claude, Codex, Gemini, and GLM."""
+"""Shared quota API client for Claude, Codex, Gemini, GLM, and DeepSeek."""
 from __future__ import annotations
 
 import json
@@ -17,6 +17,7 @@ GEMINI_PROBE_TIMEOUT = 5
 MAX_RESET_EPOCH = 32_503_680_000.0  # 3000-01-01T00:00:00Z
 GLM_QUOTA_PATH = "/api/monitor/usage/quota/limit"
 GLM_QUOTA_HOSTS = ("https://api.z.ai", "https://open.bigmodel.cn")
+DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 GLM_AVAILABLE_PCT_FIELDS = (
     "availableLimitPercentage",
     "available_limit_percentage",
@@ -141,6 +142,10 @@ def get_glm_key() -> str | None:
     return _non_empty_str(os.environ.get("ZHIPU_API_KEY"))
 
 
+def get_deepseek_key() -> str | None:
+    return _non_empty_str(os.environ.get("DEEPSEEK_API_KEY"))
+
+
 def fetch_json(req: urllib.request.Request) -> dict[str, Any]:
     ctx = ssl.create_default_context()
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as resp:
@@ -174,6 +179,28 @@ def json_number_or_none(value: Any) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def _format_money_amount(value: float) -> str:
+    return f"{value:.2f}"
+
+
+def _json_nested_number_and_display(value: Any) -> tuple[float, str] | None:
+    number = json_number_or_none(value)
+    if number is not None:
+        display = value if isinstance(value, str) and value else _format_money_amount(number)
+        return number, display
+    if isinstance(value, dict):
+        for key in ("value", "amount", "balance", "total"):
+            parsed = _json_nested_number_and_display(value.get(key))
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _json_nested_number_or_none(value: Any) -> float | None:
+    parsed = _json_nested_number_and_display(value)
+    return parsed[0] if parsed is not None else None
 
 
 def _clamp_pct(value: Any) -> float:
@@ -303,6 +330,75 @@ def _normalize_glm_quota(data: dict[str, Any], host: str) -> dict[str, Any]:
         result["remaining_fraction"] = remaining_fraction
     if balance is not None:
         result["balance"] = balance
+    return result
+
+
+def _normalize_deepseek_balance(data: dict[str, Any]) -> dict[str, Any]:
+    raw_balance_infos = data.get("balance_infos")
+    if not isinstance(raw_balance_infos, list):
+        raise ValueError("DeepSeek balance response did not include balance_infos")
+
+    balances: list[dict[str, Any]] = []
+    for raw_entry in raw_balance_infos:
+        entry = json_object(raw_entry)
+        if not entry:
+            continue
+
+        total_balance = _json_nested_number_and_display(entry.get("total_balance"))
+        granted_balance = _json_nested_number_and_display(entry.get("granted_balance"))
+        topped_up_balance = _json_nested_number_and_display(entry.get("topped_up_balance"))
+        if total_balance is None and granted_balance is None and topped_up_balance is None:
+            continue
+
+        currency = entry.get("currency")
+        balance: dict[str, Any] = {
+            "currency": currency if isinstance(currency, str) else "",
+        }
+        for result_key, display_key, amount in (
+            ("total_balance", "total_balance_display", total_balance),
+            ("granted_balance", "granted_balance_display", granted_balance),
+            ("topped_up_balance", "topped_up_balance_display", topped_up_balance),
+        ):
+            if amount is not None:
+                value, display = amount
+                balance[result_key] = value
+                balance[display_key] = display if display else _format_money_amount(value)
+        balances.append(balance)
+
+    if not balances:
+        raise ValueError("DeepSeek balance response did not include parseable balances")
+
+    preferred = next(
+        (
+            balance
+            for balance in balances
+            if balance.get("currency") == "USD" and isinstance(balance.get("total_balance"), int | float)
+        ),
+        None,
+    )
+    if preferred is None:
+        preferred = next(
+            (balance for balance in balances if isinstance(balance.get("total_balance"), int | float)),
+            None,
+        )
+    if preferred is None:
+        preferred = next((balance for balance in balances if balance.get("currency") == "USD"), balances[0])
+    is_available = data.get("is_available")
+    result: dict[str, Any] = {
+        "is_available": is_available if isinstance(is_available, bool) else False,
+        "currency": preferred.get("currency", ""),
+        "balances": balances,
+    }
+    if isinstance(preferred.get("total_balance"), int | float):
+        result["balance"] = preferred["total_balance"]
+        result["total_balance"] = preferred["total_balance"]
+    if isinstance(preferred.get("granted_balance"), int | float):
+        result["granted_balance"] = preferred["granted_balance"]
+    if isinstance(preferred.get("topped_up_balance"), int | float):
+        result["topped_up_balance"] = preferred["topped_up_balance"]
+    for display_key in ("total_balance_display", "granted_balance_display", "topped_up_balance_display"):
+        if isinstance(preferred.get(display_key), str):
+            result[display_key] = preferred[display_key]
     return result
 
 
@@ -439,6 +535,18 @@ def fetch_glm_quota() -> dict[str, Any] | None:
     return None
 
 
+def fetch_deepseek_balance() -> dict[str, Any] | None:
+    key = get_deepseek_key()
+    if not key:
+        return None
+
+    req = urllib.request.Request(
+        DEEPSEEK_BALANCE_URL,
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    return _normalize_deepseek_balance(fetch_json(req))
+
+
 def fetch_all_quotas() -> dict[str, dict[str, Any] | None]:
     """Fetch all providers with per-provider error isolation."""
     result: dict[str, dict[str, Any] | None] = {}
@@ -447,6 +555,7 @@ def fetch_all_quotas() -> dict[str, dict[str, Any] | None]:
         ("codex", fetch_codex_quota),
         ("gemini", fetch_gemini_quota),
         ("glm", fetch_glm_quota),
+        ("deepseek", fetch_deepseek_balance),
     ):
         try:
             result[name] = fetcher()
