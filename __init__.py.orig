@@ -639,15 +639,12 @@ def _fetch_gemini() -> ProviderQuota | None:
     if agy_api is not None:
         return agy_api
     cloudcode = _fetch_gemini_cloudcode()
-    if cloudcode is not None and "cloudcode_error" not in cloudcode:
+    if cloudcode is not None:
         return cloudcode
     agy_scrape = _fetch_gemini_agy()
     if agy_scrape is not None:
         return agy_scrape
-    probe = _fetch_gemini_probe()
-    if probe is not None:
-        return probe
-    return cloudcode
+    return _fetch_gemini_probe()
 
 
 _PROVIDERS: Final[dict[ProviderName, Callable[[], ProviderQuota | None]]] = {

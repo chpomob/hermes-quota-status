@@ -971,19 +971,20 @@ class HermesQuotaStatusTests(unittest.TestCase):
 
     def test_fetch_gemini_missing_key_returns_none(self) -> None:
         with (
+            patch.object(self.plugin, "_fetch_gemini_agy_api", return_value=None),
             patch.object(self.plugin, "_fetch_gemini_agy", return_value=None),
             patch.object(self.plugin, "fetch_gemini_quota", return_value=None),
             patch("gemini_cloudcode.cloudcode_token_exists", return_value=False),
         ):
             self.assertIsNone(self.plugin._fetch_gemini())
 
-    def test_fetch_gemini_agy_aggregates_only_gemini_models(self) -> None:
+    def test_fetch_gemini_agy_filters_non_gemini_pools_before_rendering(self) -> None:
         models = [
             {
                 "provider": "gemini",
                 "name": "Gemini 3.5 Flash (Medium)",
-                "remaining_pct": 72.0,
-                "used_pct": 28,
+                "remaining_pct": 90.0,
+                "used_pct": 10,
                 "reset_hours": 4,
             },
             {
@@ -1008,7 +1009,83 @@ class HermesQuotaStatusTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["model_count"], 1)
         self.assertEqual(len(result["groups"]), 1)
-        self.assertEqual(result["groups"][0]["used_pct"], 28)
+        self.assertEqual(result["groups"][0]["used_pct"], 10)
+        rendered = self.plugin._render_provider("gemini", result, False)
+        self.assertTrue(rendered.startswith("🟢 Ge:10%"), rendered)
+        self.assertNotIn("🔴", rendered)
+
+    def test_fetch_gemini_prefers_structured_agy_api_over_partial_scrape(self) -> None:
+        structured_result = {
+            "cloudcode": True,
+            "remaining_fraction": 0.72,
+            "model_count": 1,
+            "groups": [{"label": "3.5F", "remaining": 0.72, "used_pct": 28, "reset": "", "model_count": 1}],
+        }
+        partial_scrape = [{
+            "provider": "gemini",
+            "name": "Gemini 3.5 Pro (High)",
+            "remaining_pct": 5.0,
+            "used_pct": 95,
+            "reset_hours": 1,
+        }]
+
+        with patch.object(self.plugin, "_fetch_gemini_agy_api", return_value=structured_result), patch.object(
+            self.plugin.agy_quota, "fetch_agy_quota", return_value=partial_scrape
+        ) as scrape:
+            result = self.plugin._fetch_gemini()
+
+        self.assertEqual(result, structured_result)
+        scrape.assert_not_called()
+
+    def test_fetch_gemini_prefers_cloudcode_over_partial_scrape(self) -> None:
+        cloudcode_result = {
+            "cloudcode": True,
+            "remaining_fraction": 0.8,
+            "model_count": 1,
+            "groups": [{"label": "3.5F", "remaining": 0.8, "used_pct": 20, "reset": "", "model_count": 1}],
+        }
+
+        with patch.object(self.plugin, "_fetch_gemini_agy_api", return_value=None), patch.object(
+            self.plugin, "_fetch_gemini_cloudcode", return_value=cloudcode_result
+        ), patch.object(self.plugin.agy_quota, "fetch_agy_quota") as scrape:
+            result = self.plugin._fetch_gemini()
+
+        self.assertEqual(result, cloudcode_result)
+        scrape.assert_not_called()
+
+    def test_fetch_gemini_uses_scrape_when_cloudcode_returns_error(self) -> None:
+        cloudcode_error = {"cloudcode": True, "cloudcode_error": "network"}
+        scrape_result = {
+            "cloudcode": True,
+            "agy_scrape": True,
+            "remaining_fraction": 0.65,
+            "model_count": 1,
+            "groups": [{"label": "3.5F", "remaining": 0.65, "used_pct": 35, "reset": "", "model_count": 1}],
+        }
+
+        with (
+            patch.object(self.plugin, "_fetch_gemini_agy_api", return_value=None),
+            patch.object(self.plugin, "_fetch_gemini_cloudcode", return_value=cloudcode_error),
+            patch.object(self.plugin, "_fetch_gemini_agy", return_value=scrape_result),
+            patch.object(self.plugin, "_fetch_gemini_probe") as probe,
+        ):
+            result = self.plugin._fetch_gemini()
+
+        self.assertEqual(result, scrape_result)
+        probe.assert_not_called()
+
+    def test_fetch_gemini_returns_cloudcode_error_when_fallbacks_fail(self) -> None:
+        cloudcode_error = {"cloudcode": True, "cloudcode_error": "network"}
+
+        with (
+            patch.object(self.plugin, "_fetch_gemini_agy_api", return_value=None),
+            patch.object(self.plugin, "_fetch_gemini_cloudcode", return_value=cloudcode_error),
+            patch.object(self.plugin, "_fetch_gemini_agy", return_value=None),
+            patch.object(self.plugin, "_fetch_gemini_probe", return_value=None),
+        ):
+            result = self.plugin._fetch_gemini()
+
+        self.assertEqual(result, cloudcode_error)
 
     def test_fetch_codex_maps_shared_quota_shape(self) -> None:
         with patch.object(
@@ -1151,7 +1228,9 @@ class HermesQuotaStatusTests(unittest.TestCase):
         self.assertNotIn("P:", rendered)
 
     def test_fetch_gemini_maps_probe_shape(self) -> None:
-        with patch.object(self.plugin, "_fetch_gemini_agy", return_value=None), patch.object(
+        with patch.object(self.plugin, "_fetch_gemini_agy_api", return_value=None), patch.object(
+            self.plugin, "_fetch_gemini_agy", return_value=None
+        ), patch.object(
             self.plugin.gemini_cloudcode, "cloudcode_token_exists", return_value=False
         ), patch.object(
             self.plugin,
@@ -1207,7 +1286,9 @@ class HermesQuotaStatusTests(unittest.TestCase):
         self.assertEqual(result["reset_iso"], "2026-06-20T00:00:00Z")
 
     def test_fetch_gemini_falls_back_to_probe_on_cloudcode_auth_error(self) -> None:
-        with patch.object(self.plugin, "_fetch_gemini_agy", return_value=None), patch.object(
+        with patch.object(self.plugin, "_fetch_gemini_agy_api", return_value=None), patch.object(
+            self.plugin, "_fetch_gemini_agy", return_value=None
+        ), patch.object(
             self.plugin.gemini_cloudcode, "cloudcode_token_exists", return_value=True
         ), patch.object(
             self.plugin.gemini_cloudcode,
@@ -1790,6 +1871,10 @@ class HermesQuotaStatusTests(unittest.TestCase):
                 self.plugin.time,
                 "time",
                 return_value=200.0,
+            ), patch.object(
+                self.plugin,
+                "_fetch_gemini_agy_api",
+                return_value=None,
             ), patch.object(
                 self.plugin,
                 "_fetch_gemini_agy",
