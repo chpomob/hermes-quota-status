@@ -4,6 +4,7 @@ import importlib.util
 import json
 import re
 import socket
+import subprocess
 import tempfile
 import time
 import urllib.error
@@ -21,6 +22,7 @@ PLUGIN_PATH = Path(__file__).with_name("__init__.py")
 PLUGIN_METADATA_PATH = Path(__file__).with_name("plugin.yaml")
 CLOUDCODE_PATH = Path(__file__).with_name("gemini_cloudcode.py")
 QUOTA_API_PATH = Path(__file__).with_name("quota_api.py")
+AGY_QUOTA_PATH = Path(__file__).with_name("agy_quota.py")
 SPEC_PATH = Path(__file__).with_name("spec.md")
 
 ACCEPTANCE_COVERAGE: dict[str, tuple[str, ...]] = {
@@ -144,6 +146,152 @@ def load_quota_api() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_agy_quota() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("agy_quota_test", AGY_QUOTA_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load Agy quota module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class AgyQuotaTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.agy_quota = load_agy_quota()
+
+    def test_capture_usage_parses_and_tags_well_formed_gemini_block(self) -> None:
+        output = """
+            Gemini 3.5 Flash (Medium)
+            ███████░░░ 72%
+            Refreshes in 4h 19m
+        """
+
+        self.assertEqual(
+            self.agy_quota._capture_usage(output),
+            [{
+                "provider": "gemini",
+                "name": "Gemini 3.5 Flash (Medium)",
+                "remaining_pct": 72.0,
+                "used_pct": 28,
+                "reset_hours": 4,
+            }],
+        )
+
+    def test_capture_usage_skips_block_without_trailing_percentage(self) -> None:
+        output = """
+            Gemini 3.5 Flash (Medium)
+            ███████░░░ unavailable
+            Refreshes in 4h 19m
+        """
+
+        self.assertEqual(self.agy_quota._capture_usage(output), [])
+
+    def test_capture_usage_rejects_out_of_range_multi_digit_percentage(self) -> None:
+        output = """
+            Gemini 3.5 Flash (Medium)
+            ███████░░░ 1072%
+            Refreshes in 4h 19m
+        """
+
+        self.assertEqual(self.agy_quota._capture_usage(output), [])
+
+    def test_capture_usage_tags_mixed_provider_scrollback(self) -> None:
+        output = """
+            Gemini 3.5 Flash (Medium)
+            ███████░░░ 72%
+            Refreshes in 4h 19m
+            Claude Sonnet 4
+            █████░░░░░ 50%
+            GPT-5
+            ██░░░░░░░░ 20%
+            Refreshes in 1h 05m
+        """
+
+        models = self.agy_quota._capture_usage(output)
+
+        self.assertEqual([model["provider"] for model in models], ["gemini", "claude", "gpt"])
+        self.assertEqual([model["remaining_pct"] for model in models], [72.0, 50.0, 20.0])
+
+    def test_capture_usage_ignores_stray_provider_prefixed_line(self) -> None:
+        output = """
+            Claude authentication is managed in settings
+            Press Escape to return
+            Gemini 3.5 Pro (High)
+            █████████░ 90%
+        """
+
+        models = self.agy_quota._capture_usage(output)
+
+        self.assertEqual(len(models), 1)
+        self.assertEqual(models[0]["provider"], "gemini")
+
+    def test_capture_usage_ignores_provider_prose_followed_by_progress(self) -> None:
+        output = """
+            Claude replied to your last message
+            download progress 72%
+        """
+
+        self.assertEqual(self.agy_quota._capture_usage(output), [])
+
+    def test_new_tmux_session_names_are_collision_resistant(self) -> None:
+        with patch.object(self.agy_quota.os, "getpid", return_value=1234), patch.object(
+            self.agy_quota.secrets, "token_hex", side_effect=("a" * 16, "b" * 16)
+        ):
+            first = self.agy_quota._new_tmux_session_name()
+            second = self.agy_quota._new_tmux_session_name()
+
+        self.assertEqual(first, "hermes-agy-quota-1234-aaaaaaaaaaaaaaaa")
+        self.assertEqual(second, "hermes-agy-quota-1234-bbbbbbbbbbbbbbbb")
+        self.assertNotEqual(first, second)
+
+    def test_fetch_agy_quota_cleans_up_own_session_when_capture_raises(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(args)
+            if args[1] == "capture-pane":
+                raise subprocess.TimeoutExpired(args, timeout=5)
+            return subprocess.CompletedProcess(args, 0, stdout="")
+
+        session_name = "hermes-agy-quota-1234-unique"
+        with patch.object(self.agy_quota, "_new_tmux_session_name", return_value=session_name), patch.object(
+            self.agy_quota.subprocess, "run", side_effect=fake_run
+        ), patch.object(self.agy_quota.time, "sleep"):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.agy_quota.fetch_agy_quota()
+
+        self.assertEqual(calls[0], ["tmux", "new-session", "-d", "-s", session_name])
+        self.assertEqual(calls[-1], ["tmux", "kill-session", "-t", session_name])
+        self.assertEqual(sum(call[:2] == ["tmux", "kill-session"] for call in calls), 1)
+
+    def test_fetch_agy_quota_allows_graceful_shutdown_before_cleanup(self) -> None:
+        output = """
+            Gemini 3.5 Flash (Medium)
+            ███████░░░ 72%
+        """
+
+        def fake_run(args, **_kwargs):
+            stdout = output if args[1] == "capture-pane" else ""
+            return subprocess.CompletedProcess(args, 0, stdout=stdout)
+
+        session_name = "hermes-agy-quota-1234-unique"
+        with patch.object(self.agy_quota, "_new_tmux_session_name", return_value=session_name), patch.object(
+            self.agy_quota.subprocess, "run", side_effect=fake_run
+        ), patch.object(self.agy_quota.time, "sleep") as sleep:
+            models = self.agy_quota.fetch_agy_quota()
+
+        self.assertIsNotNone(models)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [
+                self.agy_quota.STARTUP_SECONDS,
+                self.agy_quota.QUOTA_SECONDS,
+                self.agy_quota.ESCAPE_SHUTDOWN_SECONDS,
+                self.agy_quota.EXIT_SHUTDOWN_SECONDS,
+            ],
+        )
 
 
 class QuotaApiNumberValidationTests(unittest.TestCase):
@@ -828,6 +976,39 @@ class HermesQuotaStatusTests(unittest.TestCase):
             patch("gemini_cloudcode.cloudcode_token_exists", return_value=False),
         ):
             self.assertIsNone(self.plugin._fetch_gemini())
+
+    def test_fetch_gemini_agy_aggregates_only_gemini_models(self) -> None:
+        models = [
+            {
+                "provider": "gemini",
+                "name": "Gemini 3.5 Flash (Medium)",
+                "remaining_pct": 72.0,
+                "used_pct": 28,
+                "reset_hours": 4,
+            },
+            {
+                "provider": "claude",
+                "name": "Claude Sonnet 4",
+                "remaining_pct": 10.0,
+                "used_pct": 90,
+                "reset_hours": 1,
+            },
+            {
+                "provider": "gpt",
+                "name": "GPT-5",
+                "remaining_pct": 20.0,
+                "used_pct": 80,
+                "reset_hours": 2,
+            },
+        ]
+
+        with patch.object(self.plugin.agy_quota, "fetch_agy_quota", return_value=models):
+            result = self.plugin._fetch_gemini_agy()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["model_count"], 1)
+        self.assertEqual(len(result["groups"]), 1)
+        self.assertEqual(result["groups"][0]["used_pct"], 28)
 
     def test_fetch_codex_maps_shared_quota_shape(self) -> None:
         with patch.object(

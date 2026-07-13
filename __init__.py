@@ -422,9 +422,10 @@ def _fetch_gemini_agy() -> ProviderQuota | None:
     try:
         models = agy_quota.fetch_agy_quota()
         if models:
+            gemini_models = [model for model in models if model.get("provider") == "gemini"]
             # Group models by (used_pct, reset_hours) — same pool
             pool_groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
-            for m in models:
+            for m in gemini_models:
                 key = (m["used_pct"], m["reset_hours"])
                 if key not in pool_groups:
                     pool_groups[key] = []
@@ -450,7 +451,7 @@ def _fetch_gemini_agy() -> ProviderQuota | None:
                     "agy_scrape": True,
                     "remaining_fraction": groups[0]["remaining"],
                     "reset_iso": groups[0].get("reset", ""),
-                    "model_count": len(models),
+                    "model_count": len(gemini_models),
                     "groups": groups,
                 }
                 return result
