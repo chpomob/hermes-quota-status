@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import socket
 import tempfile
 import time
 import urllib.error
@@ -394,6 +395,55 @@ class QuotaApiClaudeCodexWindowTests(unittest.TestCase):
         self.assertNotIn("session_pct", result)
         self.assertNotIn("session_reset", result)
         self.assertEqual(result["weekly_pct"], 48.0)
+
+
+class QuotaApiGeminiTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.quota_api = load_quota_api()
+
+    def test_fetch_gemini_quota_reports_credential_http_failures_as_invalid_key(self) -> None:
+        for status in (400, 401, 403):
+            error = urllib.error.HTTPError(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                status,
+                "credentials rejected",
+                {},
+                None,
+            )
+            with self.subTest(status=status), patch.dict(
+                self.quota_api.os.environ,
+                {"GOOGLE_API_KEY": "invalid-key"},
+                clear=True,
+            ), patch.object(self.quota_api, "fetch_json", side_effect=error):
+                result = self.quota_api.fetch_gemini_quota()
+
+            self.assertIsNotNone(result)
+            self.assertFalse(result["key_valid"])
+            self.assertTrue(result["auth_error"])
+            self.assertEqual(result["http_status"], status)
+            self.assertEqual(result["available_models"], [])
+
+    def test_fetch_gemini_quota_propagates_non_auth_validation_failures(self) -> None:
+        failures = (
+            urllib.error.URLError("network unavailable"),
+            socket.timeout("request timed out"),
+            urllib.error.HTTPError(
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                500,
+                "server error",
+                {},
+                None,
+            ),
+        )
+
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), patch.dict(
+                self.quota_api.os.environ,
+                {"GOOGLE_API_KEY": "configured-key"},
+                clear=True,
+            ), patch.object(self.quota_api, "fetch_json", side_effect=failure):
+                with self.assertRaises(type(failure)):
+                    self.quota_api.fetch_gemini_quota()
 
 
 class QuotaApiGlmTests(unittest.TestCase):
@@ -1502,6 +1552,8 @@ class HermesQuotaStatusTests(unittest.TestCase):
     def test_gemini_invalid_api_key_counts_toward_auth_suppression(self) -> None:
         invalid_key_result = {
             "key_valid": False,
+            "auth_error": True,
+            "http_status": 400,
             "available_models": [],
             "model_count": 0,
             "probe": None,
@@ -1524,6 +1576,60 @@ class HermesQuotaStatusTests(unittest.TestCase):
             rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["gemini"]}})
 
         self.assertIsNone(rendered)
+
+    def test_gemini_api_key_transport_failures_do_not_count_as_auth_failures(self) -> None:
+        quota_api = load_quota_api()
+        failures = (
+            (urllib.error.URLError("network unavailable"), "URLError"),
+            (socket.timeout("request timed out"), "TimeoutError"),
+            (
+                urllib.error.HTTPError(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    500,
+                    "server error",
+                    {},
+                    None,
+                ),
+                "http",
+            ),
+        )
+
+        for failure, expected_error_type in failures:
+            self.plugin._auth_failure_counts["gemini"] = 2
+            self.plugin._last_errors.clear()
+            with self.subTest(failure=type(failure).__name__), patch.dict(
+                quota_api.os.environ,
+                {"GOOGLE_API_KEY": "configured-key"},
+                clear=True,
+            ), patch.object(
+                quota_api,
+                "fetch_json",
+                side_effect=failure,
+            ), patch.object(
+                self.plugin.time,
+                "time",
+                return_value=200.0,
+            ), patch.object(
+                self.plugin,
+                "_fetch_gemini_agy",
+                return_value=None,
+            ), patch.object(
+                self.plugin,
+                "_fetch_gemini_cloudcode",
+                return_value=None,
+            ), patch.object(
+                self.plugin,
+                "fetch_gemini_quota",
+                new=quota_api.fetch_gemini_quota,
+            ), patch.dict(
+                self.plugin._PROVIDERS,
+                {"gemini": self.plugin._fetch_gemini},
+                clear=True,
+            ):
+                self.plugin._refresh_cache(("gemini",))
+
+            self.assertEqual(self.plugin._auth_failure_counts["gemini"], 2)
+            self.assertEqual(self.plugin._last_errors[-1]["type"], expected_error_type)
 
     def test_gemini_cloudcode_forbidden_counts_toward_auth_suppression(self) -> None:
         forbidden_result = {"cloudcode": True, "cloudcode_error": "forbidden"}

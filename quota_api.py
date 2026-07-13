@@ -15,6 +15,7 @@ from typing import Any
 MAX_RESPONSE_BYTES = 1_048_576
 HTTP_TIMEOUT = 8
 GEMINI_PROBE_TIMEOUT = 5
+GEMINI_AUTH_HTTP_STATUSES = frozenset({400, 401, 403})
 MAX_RESET_EPOCH = 32_503_680_000.0  # 3000-01-01T00:00:00Z
 GLM_QUOTA_PATH = "/api/monitor/usage/quota/limit"
 GLM_QUOTA_HOSTS = ("https://api.z.ai", "https://open.bigmodel.cn")
@@ -474,8 +475,19 @@ def fetch_gemini_quota() -> dict[str, Any] | None:
     )
     try:
         data = fetch_json(req)
-    except Exception as exc:
-        return {"error": str(exc), "available_models": [], "key_valid": False}
+    except urllib.error.HTTPError as exc:
+        # Only responses that reject the request credentials establish that the
+        # key is invalid. Transport errors and upstream 5xx responses must
+        # propagate so callers can retry them without recording an auth failure.
+        if exc.code not in GEMINI_AUTH_HTTP_STATUSES:
+            raise
+        return {
+            "error": str(exc),
+            "auth_error": True,
+            "http_status": exc.code,
+            "available_models": [],
+            "key_valid": False,
+        }
 
     models = []
     raw_models = data.get("models")

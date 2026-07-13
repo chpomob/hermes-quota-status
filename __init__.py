@@ -27,6 +27,7 @@ try:
     from . import gemini_cloudcode
     from . import agy_quota
     from .quota_api import (
+        GEMINI_AUTH_HTTP_STATUSES,
         fetch_claude_quota,
         fetch_codex_quota,
         fetch_deepseek_balance,
@@ -48,6 +49,7 @@ except ImportError:
     import gemini_cloudcode  # type: ignore[no-redef]
     import agy_quota  # type: ignore[no-redef]
     from quota_api import (  # type: ignore[no-redef]
+        GEMINI_AUTH_HTTP_STATUSES,
         fetch_claude_quota,
         fetch_codex_quota,
         fetch_deepseek_balance,
@@ -99,16 +101,6 @@ ERROR_RETRY_TTL: Final[int] = 30
 AUTH_RETRY_TTL: Final[int] = 300
 AUTH_FAILURE_SUPPRESSION_THRESHOLD: Final[int] = 3
 CREDENTIAL_REQUIRED_OMIT_PROVIDERS: Final[tuple[ProviderName, ...]] = ("glm", "deepseek")
-GEMINI_AUTH_ERROR_STRINGS: Final[tuple[str, ...]] = (
-    "api key",
-    "bad request",
-    "forbidden",
-    "http error 400",
-    "http error 401",
-    "http error 403",
-    "permission",
-    "unauthorized",
-)
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +203,8 @@ class ProviderQuota(TypedDict, total=False):
     monthly_prompt_credits: float
     plan_type: str
     key_valid: bool
+    auth_error: bool
+    http_status: int
     available_models: list[str]
     model_count: int
     probe: dict[str, Any] | None
@@ -620,10 +614,13 @@ def _fetch_gemini_probe() -> ProviderQuota | None:
     probe = data.get("probe")
     result: ProviderQuota = {
         "key_valid": bool(data.get("key_valid")),
+        "auth_error": data.get("auth_error") is True,
         "available_models": [m for m in available_models if isinstance(m, str)] if isinstance(available_models, list) else [],
         "model_count": int(json_number(data.get("model_count"))),
         "probe": probe if isinstance(probe, dict) else None,
     }
+    if isinstance(data.get("http_status"), int):
+        result["http_status"] = data["http_status"]
     if isinstance(data.get("error"), str):
         result["error"] = data["error"]
     return result
@@ -691,13 +688,8 @@ def _provider_result_auth_error_type(provider: ProviderName, result: ProviderQuo
             return "missing_token"
         return None
 
-    if result.get("key_valid") is False:
-        error = result.get("error")
-        if not isinstance(error, str):
-            return None
-        normalized_error = error.lower()
-        if any(auth_error in normalized_error for auth_error in GEMINI_AUTH_ERROR_STRINGS):
-            return "auth"
+    if result.get("key_valid") is False and result.get("auth_error") is True:
+        return "auth"
     return None
 
 
@@ -802,7 +794,8 @@ def _refresh_cache(due_providers: tuple[ProviderName, ...] | None = None) -> Non
             try:
                 result = fetcher()
             except urllib.error.HTTPError as exc:
-                error_type = "auth" if exc.code in (401, 403) else "http"
+                auth_statuses = GEMINI_AUTH_HTTP_STATUSES if provider == "gemini" else (401, 403)
+                error_type = "auth" if exc.code in auth_statuses else "http"
                 _mark_provider_error(provider, error_type, http_status=exc.code)
                 continue
             except (OSError, TimeoutError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
