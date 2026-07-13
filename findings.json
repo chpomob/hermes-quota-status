@@ -1,0 +1,107 @@
+[
+  {
+    "id": "C1",
+    "severity": "blocker",
+    "summary": "TUI scraper fabricates healthy quota on parse failure",
+    "detail": "_capture_usage() initializes remaining_pct=100 and appends the model even when the bar line fails the (\\d+)%$ regex. Any scrollback line starting with 'Gemini', 'Claude', or 'GPT' is treated as a model block. Parse miss = fabricated 0%-used quota. Fix: fail-closed, return None/skip on parse miss.",
+    "file": "agy_quota.py:49-54"
+  },
+  {
+    "id": "C2",
+    "severity": "blocker",
+    "summary": "Authentication failures bypass and reset R15 suppression",
+    "detail": "_fetch_gemini_cloudcode() collapses auth failures to None, classified as missing_token which never increments R15 counter. _agy_api_fetch_models() blanket-catches HTTP 401/403 as None. Both call _reset_auth_failures() on missing_token, erasing prior auth failures. Test locks in contradictory behavior.",
+    "file": "__init__.py:549-556, 746, 761, 817"
+  },
+  {
+    "id": "C3",
+    "severity": "blocker",
+    "summary": "Fixed tmux session name causes destructive cross-process collisions",
+    "detail": "Every process uses constant 'hermes-agy-quota' and unconditionally kill-sessions it at start. Two Hermes instances kill each other's in-flight scrape. Cleanup not finally-protected. Fix: PID/UUID-suffixed session name, try/finally.",
+    "file": "agy_quota.py:18"
+  },
+  {
+    "id": "C4",
+    "severity": "major",
+    "summary": "Global refresh flag + serial fetch: head-of-line blocking, possibly permanent",
+    "detail": "One boolean refreshing flag for whole cache. Gemini path stacks 40+ seconds worst-case, blocking Claude/Codex/GLM/DeepSeek. Secret.Service.get_sync() has no timeout. Fix: per-provider refresh workers or deadline on keyring.",
+    "file": "__init__.py:651, 722, 798"
+  },
+  {
+    "id": "C5",
+    "severity": "major",
+    "summary": "Partial TUI viewport treated as authoritative, suppressing better fallbacks",
+    "detail": "Scraper captures ~14 of ~33 lines. Any nonempty scrape returns immediately, skipping structured API and OAuth paths. Fix: demote scrape to best-effort supplement or merge with structured results.",
+    "file": "__init__.py:338, 429"
+  },
+  {
+    "id": "C6",
+    "severity": "major",
+    "summary": "Non-Gemini pools contaminate the Gemini segment",
+    "detail": "Scraper captures Gemini, Claude and GPT blocks, but _fetch_gemini_agy() groups all without provider filtering. Exhausted Claude/GPT pool renders red Ge segment while Gemini quota is healthy.",
+    "file": "agy_quota.py:37, __init__.py:430"
+  },
+  {
+    "id": "C7",
+    "severity": "major",
+    "summary": "Non-finite numeric values (NaN/Infinity) pass validation",
+    "detail": "json_number_or_none() accepts NaN/±Infinity with no math.isfinite() check. NaN used-percentage clamps to 0% (falsely healthy). DeepSeek NaN balance renders as green $NaN. Fix: reject non-finite values.",
+    "file": "quota_api.py:139, 171"
+  },
+  {
+    "id": "C8",
+    "severity": "major",
+    "summary": "Gemini transport failures rendered as invalid API key",
+    "detail": "fetch_gemini_quota() catches every models.list failure (timeout, DNS, HTTP 5xx) and returns key_valid=False. Network blip becomes false credential alarm Ge:KEY. Fix: distinguish transport failure from auth failure.",
+    "file": "quota_api.py:474"
+  },
+  {
+    "id": "M1",
+    "severity": "minor",
+    "summary": "Agy API response read without context manager or size cap",
+    "detail": "Response body read without 1 MB cap or context manager. Drip-fed body can grow unboundedly while holding the sole refresh worker (compounds C4).",
+    "file": "__init__.py:330, 413"
+  },
+  {
+    "id": "M2",
+    "severity": "minor",
+    "summary": "Non-ISO reset_iso value in Agy path breaks field type contract",
+    "detail": "Agy path stores '+3h'-style strings in reset_iso field. Every other producer/consumer treats it as ISO-8601. datetime.fromisoformat silently yields None. Store ISO form or use distinct key.",
+    "file": "__init__.py:458"
+  },
+  {
+    "id": "M3",
+    "severity": "minor",
+    "summary": "Retained stale cache data never shown to user",
+    "detail": "Cache retained on transient errors (test asserts this), but every renderer short-circuits to '?' when is_stale is set. 30s network blip degrades 2-minute-old reading to '?'. Either render retained value marked stale or stop retaining.",
+    "file": "__init__.py:741"
+  },
+  {
+    "id": "M4",
+    "severity": "minor",
+    "summary": "Keyring fallback fragile and triggers desktop unlock prompts",
+    "detail": "Substring-matches any label containing 'antigravity', blindly indexes ['token']['access_token'] with no shape validation, enumerates/unlocks entire keyring on every refresh. Fix: match exact attributes, validate shape, cache between refreshes.",
+    "file": "__init__.py:393"
+  },
+  {
+    "id": "M5",
+    "severity": "minor",
+    "summary": "GLM fallback forwards credential to secondary host on auth failure",
+    "detail": "GLM fallback forwards the same raw credential to open.bigmodel.cn on ANY primary failure including 401/403. Spec R3 mandates fallback only for host-availability failures. Skip fallback on auth rejection.",
+    "file": "quota_api.py:535"
+  },
+  {
+    "id": "N1",
+    "severity": "nit",
+    "summary": "Dead code: _fmt_reset_hours",
+    "detail": "_fmt_reset_hours in __init__.py is dead code and collides confusingly with live _fmt_reset / _fmt_hours_until helpers.",
+    "file": "__init__.py:363"
+  },
+  {
+    "id": "N2",
+    "severity": "nit",
+    "summary": "Hard-coded Google OAuth client secret lacks provenance comment",
+    "detail": "gemini_cloudcode.py has hard-coded Google OAuth client secret. Acceptable for installed-app flows, but is a third party's credential reused by unaffiliated tool. Add provenance/ToS comment.",
+    "file": "gemini_cloudcode.py:27"
+  }
+]
