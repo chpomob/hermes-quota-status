@@ -44,9 +44,18 @@ ACCEPTANCE_COVERAGE: dict[str, tuple[str, ...]] = {
     "AC16": ("test_render_current_and_expired_resets_as_zero_countdown",),
     "AC17": ("test_render_width_60_trims_to_limit",),
     "AC18": ("test_render_width_60_trims_at_well_formed_segment_boundaries",),
-    "AC19": ("test_auth_failure_suppresses_provider_after_third_consecutive_failure",),
-    "AC20": ("test_auth_failure_suppression_is_independent_per_provider",),
-    "AC21": ("test_suppression_recovery_renders_provider_after_successful_refresh",),
+    "AC19": (
+        "test_auth_failure_suppresses_provider_after_third_consecutive_failure",
+        "test_public_render_drives_suppression_background_refresh_and_recovery",
+    ),
+    "AC20": (
+        "test_auth_failure_suppression_is_independent_per_provider",
+        "test_public_render_drives_suppression_background_refresh_and_recovery",
+    ),
+    "AC21": (
+        "test_suppression_recovery_renders_provider_after_successful_refresh",
+        "test_public_render_drives_suppression_background_refresh_and_recovery",
+    ),
     "AC22": ("test_acceptance_claude_codex_and_gemini_render_one_segment_each_when_available",),
     "AC23": ("test_plugin_metadata_documents_v2_providers_and_config_surface",),
     "AC24": (
@@ -78,8 +87,12 @@ ACCEPTANCE_COVERAGE: dict[str, tuple[str, ...]] = {
         "test_v2_provider_identity_order_and_cache_initialization",
         "test_non_auth_failures_leave_auth_failure_counter_unchanged",
         "test_successful_authenticated_check_resets_auth_failure_counter",
+        "test_concurrent_auth_failure_recordings_are_atomic",
     ),
-    "AC32": ("test_suppressed_provider_is_fetched_on_later_refreshes",),
+    "AC32": (
+        "test_suppressed_provider_is_fetched_on_later_refreshes",
+        "test_public_render_drives_suppression_background_refresh_and_recovery",
+    ),
 }
 
 
@@ -102,6 +115,12 @@ ACCEPTANCE_IDS_BY_TEST_METHOD: dict[str, tuple[str, ...]] = {
     "test_auth_failure_suppresses_provider_after_third_consecutive_failure": ("AC19", "AC24"),
     "test_auth_failure_suppression_is_independent_per_provider": ("AC20",),
     "test_suppression_recovery_renders_provider_after_successful_refresh": ("AC21", "AC24"),
+    "test_public_render_drives_suppression_background_refresh_and_recovery": (
+        "AC19",
+        "AC20",
+        "AC21",
+        "AC32",
+    ),
     "test_acceptance_claude_codex_and_gemini_render_one_segment_each_when_available": ("AC22",),
     "test_plugin_metadata_documents_v2_providers_and_config_surface": ("AC23",),
     "test_get_glm_key_prefers_glm_api_key_over_zhipu_api_key": ("AC24",),
@@ -113,6 +132,7 @@ ACCEPTANCE_IDS_BY_TEST_METHOD: dict[str, tuple[str, ...]] = {
     "test_render_missing_width_does_not_apply_60_character_cap": ("AC30",),
     "test_v2_provider_identity_order_and_cache_initialization": ("AC31",),
     "test_successful_authenticated_check_resets_auth_failure_counter": ("AC31",),
+    "test_concurrent_auth_failure_recordings_are_atomic": ("AC31",),
     "test_suppressed_provider_is_fetched_on_later_refreshes": ("AC32",),
 }
 
@@ -155,6 +175,18 @@ def load_agy_quota() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+class SynchronousThread:
+    """Test double that runs a background-thread target deterministically."""
+
+    def __init__(self, *, target, args=(), kwargs=None, **_thread_options) -> None:
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self) -> None:
+        self._target(*self._args, **self._kwargs)
 
 
 class AgyQuotaTests(unittest.TestCase):
@@ -923,6 +955,16 @@ class HermesQuotaStatusTests(unittest.TestCase):
     def setUp(self) -> None:
         self.plugin = load_plugin()
 
+    def _render_with_synchronous_refresh(
+        self, providers: tuple[str, ...], *, now: float
+    ) -> str | None:
+        with patch.object(self.plugin.time, "time", return_value=now), patch.object(
+            self.plugin, "_refresh_thread_factory", SynchronousThread
+        ):
+            return self.plugin.on_status_bar_render(
+                {"quota_status": {"providers": list(providers)}}
+            )
+
     def _seed_all_provider_cache(self) -> None:
         self.plugin._cache["claude"] = {"session_pct": 24.0, "reset_iso": ""}
         self.plugin._cache["codex"] = {"session_pct": 11.0, "reset_iso": ""}
@@ -1394,7 +1436,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
         fake_thread = MagicMock()
         fake_thread.start.side_effect = RuntimeError("thread failed")
 
-        with patch.object(self.plugin.threading, "Thread", return_value=fake_thread):
+        with patch.object(self.plugin, "_refresh_thread_factory", return_value=fake_thread):
             with self.assertRaises(RuntimeError):
                 self.plugin._start_refresh_if_needed(self.plugin.PROVIDERS)
 
@@ -1671,6 +1713,113 @@ class HermesQuotaStatusTests(unittest.TestCase):
             self.assertEqual(self.plugin._auth_failure_counts[provider], 0)
 
         self.assertEqual(self.plugin._due_providers(0.0), active_fetchers)
+
+    def test_concurrent_auth_failure_recordings_are_atomic(self) -> None:
+        worker_count = 16
+        start_barrier = self.plugin.threading.Barrier(worker_count, timeout=2)
+        worker_errors: list[BaseException] = []
+        threading_module = self.plugin.threading
+
+        class RaceDetectingCounterDict(dict[str, int]):
+            """Make an unguarded read-modify-write lose an update deterministically."""
+
+            def __init__(self) -> None:
+                super().__init__(claude=0)
+                self._state_lock = threading_module.Lock()
+                self._second_reader_started = threading_module.Event()
+                self._active_readers = 0
+                self._get_calls = 0
+                self.overlap_observed = False
+
+            def get(self, key: str, default: int = 0) -> int:
+                value = super().get(key, default)
+                with self._state_lock:
+                    self._get_calls += 1
+                    call_number = self._get_calls
+                    self._active_readers += 1
+                    if self._active_readers > 1:
+                        self.overlap_observed = True
+                        self._second_reader_started.set()
+                try:
+                    if call_number == 1:
+                        self._second_reader_started.wait(timeout=0.5)
+                    return value
+                finally:
+                    with self._state_lock:
+                        self._active_readers -= 1
+
+        counters = RaceDetectingCounterDict()
+
+        def record_failure() -> None:
+            try:
+                start_barrier.wait()
+                self.plugin._record_auth_failure("claude")
+            except BaseException as exc:
+                worker_errors.append(exc)
+
+        workers = [
+            self.plugin.threading.Thread(target=record_failure, daemon=True)
+            for _ in range(worker_count)
+        ]
+        with patch.object(self.plugin, "_auth_failure_counts", counters):
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=3)
+
+            self.assertEqual(worker_errors, [])
+            self.assertFalse(counters.overlap_observed)
+            self.assertEqual(
+                self.plugin._auth_failure_counts_snapshot()["claude"],
+                worker_count,
+            )
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+
+    def test_public_render_drives_suppression_background_refresh_and_recovery(self) -> None:
+        auth_error = urllib.error.HTTPError(
+            "https://example.test", 401, "unauthorized", {}, None
+        )
+        claude_fetcher = MagicMock(
+            side_effect=(
+                auth_error,
+                auth_error,
+                auth_error,
+                {"session_pct": 18.0, "reset_iso": ""},
+            )
+        )
+        codex_fetcher = MagicMock(
+            return_value={"session_pct": 12.0, "reset_iso": ""}
+        )
+
+        with patch.dict(
+            self.plugin._PROVIDERS,
+            {"claude": claude_fetcher, "codex": codex_fetcher},
+            clear=True,
+        ):
+            first = self._render_with_synchronous_refresh(
+                ("claude", "codex"), now=200.0
+            )
+            second = self._render_with_synchronous_refresh(
+                ("claude", "codex"), now=500.0
+            )
+            suppressed = self._render_with_synchronous_refresh(
+                ("claude", "codex"), now=800.0
+            )
+            suppressed_counts = self.plugin._auth_failure_counts_snapshot()
+            recovered = self._render_with_synchronous_refresh(
+                ("claude", "codex"), now=1100.0
+            )
+
+        self.assertEqual(first, "🔴 C:? │ 🟢 Cx:12%")
+        self.assertEqual(second, "🔴 C:? │ 🟢 Cx:12%")
+        self.assertEqual(suppressed, "🟢 Cx:12%")
+        self.assertEqual(suppressed_counts["claude"], 3)
+        self.assertEqual(suppressed_counts["codex"], 0)
+        self.assertEqual(recovered, "🟢 C:18% │ 🟢 Cx:12%")
+        self.assertEqual(self.plugin._auth_failure_counts_snapshot()["claude"], 0)
+        self.assertEqual(claude_fetcher.call_count, 4)
+        self.assertEqual(codex_fetcher.call_count, 4)
 
     def test_auth_failure_suppresses_provider_after_third_consecutive_failure(self) -> None:
         auth_error = urllib.error.HTTPError("https://example.test", 401, "unauthorized", {}, None)

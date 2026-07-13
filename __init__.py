@@ -125,6 +125,7 @@ __all__ = [
 
 _cloudcode_login_thread: threading.Thread | None = None
 _cloudcode_login_lock = threading.Lock()
+_refresh_thread_factory: Callable[..., threading.Thread] = threading.Thread
 
 
 def _run_cloudcode_login() -> None:
@@ -245,7 +246,11 @@ _cache: CacheState = {
     "missing_credentials": set(),
     "next_retry": {provider: 0.0 for provider in PROVIDERS},
 }
-_cache_lock = threading.Lock()
+# Authentication counters and cached provider data form one render snapshot.
+# A re-entrant lock lets the counter helpers enforce synchronization even when
+# their caller is already updating the cache, while keeping network I/O outside
+# the critical section in the refresh loop.
+_cache_lock = threading.RLock()
 _last_errors: list[ProviderError] = []
 _auth_failure_counts: dict[ProviderName, int] = {provider: 0 for provider in PROVIDERS}
 
@@ -717,11 +722,18 @@ def _retry_ttl(error_type: str) -> int:
 
 
 def _record_auth_failure(provider: ProviderName) -> None:
-    _auth_failure_counts[provider] = _auth_failure_counts.get(provider, 0) + 1
+    with _cache_lock:
+        _auth_failure_counts[provider] = _auth_failure_counts.get(provider, 0) + 1
 
 
 def _reset_auth_failures(provider: ProviderName) -> None:
-    _auth_failure_counts[provider] = 0
+    with _cache_lock:
+        _auth_failure_counts[provider] = 0
+
+
+def _auth_failure_counts_snapshot() -> dict[ProviderName, int]:
+    with _cache_lock:
+        return dict(_auth_failure_counts)
 
 
 def _provider_auth_suppressed(provider: ProviderName, auth_failure_counts: Mapping[ProviderName, int]) -> bool:
@@ -880,7 +892,7 @@ def _start_refresh_if_needed(providers: tuple[ProviderName, ...]) -> None:
         return
 
     try:
-        thread = threading.Thread(
+        thread = _refresh_thread_factory(
             target=_refresh_cache,
             args=(due_providers,),
             name="hermes-quota-refresh",
@@ -1335,7 +1347,7 @@ def on_status_bar_render(snapshot=None, **kwargs) -> str | None:
                 **{provider: _cache[provider] for provider in render_providers},
                 "stale": set(_cache["stale"]),
                 "missing_credentials": set(_cache["missing_credentials"]),
-                "auth_failure_counts": dict(_auth_failure_counts),
+                "auth_failure_counts": _auth_failure_counts_snapshot(),
             }
 
         parts = []
