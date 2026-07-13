@@ -540,11 +540,19 @@ def fetch_glm_quota() -> dict[str, Any] | None:
         )
         try:
             return _normalize_glm_quota(fetch_json(req), host)
-        except urllib.error.HTTPError as exc:
-            last_error = exc
-        except (OSError, TimeoutError, ValueError) as exc:
+        except (urllib.error.HTTPError, OSError, TimeoutError, ValueError) as exc:
+            # R3 requires the secondary host whenever the primary cannot
+            # produce a successful quota response, including authentication
+            # failures and malformed responses. Unexpected programming errors
+            # are allowed to surface immediately instead of being masked by a
+            # successful fallback request.
             last_error = exc
 
+    # Authentication accounting happens once for the overall provider check,
+    # not once per host. The final host is authoritative because a credential
+    # can be valid for open.bigmodel.cn even when api.z.ai rejects it. Raising
+    # its failure also avoids classifying a secondary availability incident as
+    # an authentication failure based on an earlier 401 or ambiguous 403.
     if last_error is not None:
         raise last_error
     return None

@@ -455,6 +455,23 @@ class QuotaApiGlmTests(unittest.TestCase):
             with self.subTest(env=env), patch.dict(self.quota_api.os.environ, env, clear=True):
                 self.assertEqual(self.quota_api.get_glm_key(), "zhipu-raw")
 
+    def test_fetch_glm_quota_uses_zhipu_header_when_glm_key_is_empty(self) -> None:
+        requests = []
+
+        def fake_fetch(req):
+            requests.append(req)
+            return {"data": {"availableLimitPercentage": 100}}
+
+        with patch.dict(
+            self.quota_api.os.environ,
+            {"GLM_API_KEY": "", "ZHIPU_API_KEY": "zhipu-raw"},
+            clear=True,
+        ), patch.object(self.quota_api, "fetch_json", side_effect=fake_fetch):
+            self.quota_api.fetch_glm_quota()
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].get_header("Authorization"), "zhipu-raw")
+
     def test_fetch_glm_quota_uses_raw_non_bearer_authorization(self) -> None:
         requests = []
 
@@ -544,6 +561,45 @@ class QuotaApiGlmTests(unittest.TestCase):
         self.assertEqual(result["host"], "https://open.bigmodel.cn")
         self.assertEqual(result["session_pct"], 9.0)
 
+    def test_fetch_glm_quota_falls_back_after_every_primary_failure_class(self) -> None:
+        primary_failures = (
+            urllib.error.HTTPError("https://api.z.ai", 503, "unavailable", {}, None),
+            TimeoutError("primary timed out"),
+            urllib.error.HTTPError("https://api.z.ai", 401, "unauthorized", {}, None),
+            urllib.error.HTTPError("https://api.z.ai", 403, "forbidden", {}, None),
+            json.JSONDecodeError("invalid JSON", "not-json", 0),
+        )
+
+        for primary_failure in primary_failures:
+            requests = []
+
+            def fake_fetch(req):
+                requests.append(req)
+                if len(requests) == 1:
+                    raise primary_failure
+                return {"data": {"availableLimitPercentage": 91}}
+
+            with self.subTest(
+                failure=type(primary_failure).__name__,
+                code=getattr(primary_failure, "code", None),
+            ), patch.dict(
+                self.quota_api.os.environ,
+                {"GLM_API_KEY": "glm-raw"},
+                clear=True,
+            ), patch.object(self.quota_api, "fetch_json", side_effect=fake_fetch):
+                result = self.quota_api.fetch_glm_quota()
+
+            self.assertIsNotNone(result)
+            self.assertEqual(
+                [request.full_url for request in requests],
+                [
+                    "https://api.z.ai/api/monitor/usage/quota/limit",
+                    "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
+                ],
+            )
+            self.assertEqual(result["host"], "https://open.bigmodel.cn")
+            self.assertEqual(result["session_pct"], 9.0)
+
     def test_fetch_glm_quota_raises_auth_error_after_all_hosts_fail_auth(self) -> None:
         urls = []
 
@@ -564,6 +620,53 @@ class QuotaApiGlmTests(unittest.TestCase):
                 "https://open.bigmodel.cn/api/monitor/usage/quota/limit",
             ],
         )
+
+    def test_fetch_glm_quota_uses_final_host_failure_for_classification(self) -> None:
+        errors = (
+            urllib.error.HTTPError("https://api.z.ai", 401, "unauthorized", {}, None),
+            urllib.error.HTTPError("https://open.bigmodel.cn", 500, "server error", {}, None),
+        )
+
+        with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "bad-key"}, clear=True), patch.object(
+            self.quota_api,
+            "fetch_json",
+            side_effect=errors,
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self.quota_api.fetch_glm_quota()
+
+        self.assertEqual(raised.exception.code, 500)
+
+    def test_fetch_glm_quota_does_not_mask_programming_errors(self) -> None:
+        with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "glm-raw"}, clear=True), patch.object(
+            self.quota_api,
+            "fetch_json",
+            return_value={"data": {"availableLimitPercentage": 91}},
+        ) as fetch_json, patch.object(
+            self.quota_api,
+            "_normalize_glm_quota",
+            side_effect=TypeError("normalizer bug"),
+        ):
+            with self.assertRaisesRegex(TypeError, "normalizer bug"):
+                self.quota_api.fetch_glm_quota()
+
+        fetch_json.assert_called_once()
+
+    def test_fetch_glm_quota_keeps_all_host_server_failures_non_auth(self) -> None:
+        errors = (
+            urllib.error.HTTPError("https://api.z.ai", 500, "server error", {}, None),
+            urllib.error.HTTPError("https://open.bigmodel.cn", 503, "unavailable", {}, None),
+        )
+
+        with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "glm-raw"}, clear=True), patch.object(
+            self.quota_api,
+            "fetch_json",
+            side_effect=errors,
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                self.quota_api.fetch_glm_quota()
+
+        self.assertEqual(raised.exception.code, 503)
 
     def test_fetch_glm_quota_supports_bigmodel_limit_shape(self) -> None:
         with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "glm-raw"}, clear=True), patch.object(
@@ -1268,6 +1371,82 @@ class HermesQuotaStatusTests(unittest.TestCase):
             rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["claude", "codex"]}})
 
         self.assertEqual(rendered, "🟢 Cx:12%")
+
+    def test_glm_fallback_success_after_auth_rejection_resets_auth_counter(self) -> None:
+        quota_api = load_quota_api()
+        primary_auth_error = urllib.error.HTTPError(
+            "https://api.z.ai/api/monitor/usage/quota/limit",
+            401,
+            "unauthorized",
+            {},
+            None,
+        )
+        self.plugin._auth_failure_counts["glm"] = 2
+
+        with patch.dict(quota_api.os.environ, {"GLM_API_KEY": "glm-raw"}, clear=True), patch.object(
+            quota_api,
+            "fetch_json",
+            side_effect=(primary_auth_error, {"data": {"availableLimitPercentage": 91}}),
+        ), patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
+            self.plugin._PROVIDERS,
+            {"glm": quota_api.fetch_glm_quota},
+            clear=True,
+        ):
+            self.plugin._refresh_cache(("glm",))
+
+        self.assertEqual(self.plugin._auth_failure_counts["glm"], 0)
+        self.assertEqual(self.plugin._cache["glm"]["host"], "https://open.bigmodel.cn")
+        self.assertNotIn("glm", self.plugin._cache["stale"])
+
+    def test_glm_auth_accounting_uses_combined_host_outcome(self) -> None:
+        quota_api = load_quota_api()
+        cases = (
+            (
+                (
+                    urllib.error.HTTPError("https://api.z.ai", 401, "unauthorized", {}, None),
+                    urllib.error.HTTPError("https://open.bigmodel.cn", 500, "server error", {}, None),
+                ),
+                0,
+                "http",
+            ),
+            (
+                (
+                    urllib.error.HTTPError("https://api.z.ai", 403, "forbidden", {}, None),
+                    urllib.error.HTTPError("https://open.bigmodel.cn", 503, "unavailable", {}, None),
+                ),
+                0,
+                "http",
+            ),
+            (
+                (
+                    urllib.error.HTTPError("https://api.z.ai", 500, "server error", {}, None),
+                    urllib.error.HTTPError("https://open.bigmodel.cn", 503, "unavailable", {}, None),
+                ),
+                0,
+                "http",
+            ),
+        )
+
+        for host_errors, expected_auth_failures, expected_error_type in cases:
+            self.plugin._auth_failure_counts["glm"] = 0
+            self.plugin._last_errors.clear()
+            with self.subTest(error_type=expected_error_type), patch.dict(
+                quota_api.os.environ,
+                {"GLM_API_KEY": "glm-raw"},
+                clear=True,
+            ), patch.object(quota_api, "fetch_json", side_effect=host_errors), patch.object(
+                self.plugin.time,
+                "time",
+                return_value=200.0,
+            ), patch.dict(
+                self.plugin._PROVIDERS,
+                {"glm": quota_api.fetch_glm_quota},
+                clear=True,
+            ):
+                self.plugin._refresh_cache(("glm",))
+
+            self.assertEqual(self.plugin._auth_failure_counts["glm"], expected_auth_failures)
+            self.assertEqual(self.plugin._last_errors[-1]["type"], expected_error_type)
 
     def test_non_auth_failures_leave_auth_failure_counter_unchanged(self) -> None:
         errors = (
