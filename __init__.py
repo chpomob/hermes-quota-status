@@ -100,6 +100,7 @@ CACHE_TTL: Final[int] = 120
 ERROR_RETRY_TTL: Final[int] = 30
 AUTH_RETRY_TTL: Final[int] = 300
 AUTH_FAILURE_SUPPRESSION_THRESHOLD: Final[int] = 3
+AGY_AUTH_HTTP_STATUSES: Final[frozenset[int]] = frozenset({401, 403})
 CREDENTIAL_REQUIRED_OMIT_PROVIDERS: Final[tuple[ProviderName, ...]] = ("glm", "deepseek")
 
 logger = logging.getLogger(__name__)
@@ -367,8 +368,9 @@ def _fmt_reset_hours(iso_str: str) -> str:
 def _agy_api_fetch_models() -> dict[str, Any] | None:
     """Fetch model data from daily-cloudcode-pa using agy's keyring token.
 
-    Returns the structured API response with displayNames, or None if
-    the keyring token is unavailable or the API call fails.
+    Returns the structured API response with displayNames. Returns None when
+    the keyring token is unavailable or a non-authentication API call fails;
+    HTTP 401/403 errors are propagated so the source coordinator can fall back.
     """
     try:
         import gi
@@ -407,6 +409,11 @@ def _agy_api_fetch_models() -> dict[str, Any] | None:
         )
         resp = urllib.request.urlopen(req, timeout=8, context=ssl.create_default_context())
         return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        logger.debug("agy API fetch failed", exc_info=True)
+        if exc.code in AGY_AUTH_HTTP_STATUSES:
+            raise
+        return None
     except Exception:
         logger.debug("agy API fetch failed", exc_info=True)
         return None
@@ -446,7 +453,6 @@ def _fetch_gemini_agy() -> ProviderQuota | None:
             groups.sort(key=lambda g: -g["used_pct"])
             if groups:
                 result: ProviderQuota = {
-                    "cloudcode": True,
                     "agy_scrape": True,
                     "remaining_fraction": groups[0]["remaining"],
                     "reset_iso": groups[0].get("reset", ""),
@@ -461,7 +467,12 @@ def _fetch_gemini_agy() -> ProviderQuota | None:
 
 
 def _fetch_gemini_agy_api() -> ProviderQuota | None:
-    """Fetch Gemini quota from Agy's structured daily Cloud Code API."""
+    """Fetch Gemini quota from Agy's structured daily Cloud Code API.
+
+    Returns None when no structured quota is available. HTTP 401/403 errors
+    from agy's keyring credential are propagated so callers can use another
+    source without attributing the failure to Cloud Code credentials.
+    """
 
     try:
         api_data = _agy_api_fetch_models()
@@ -509,6 +520,11 @@ def _fetch_gemini_agy_api() -> ProviderQuota | None:
                 result["remaining_fraction"] = groups[0]["remaining"]
                 result["reset_iso"] = groups[0].get("reset", "")
                 return result
+    except urllib.error.HTTPError as exc:
+        logger.debug("agy API fetch failed", exc_info=True)
+        if exc.code in AGY_AUTH_HTTP_STATUSES:
+            raise
+        return None
     except Exception:
         logger.debug("agy API fetch failed", exc_info=True)
 
@@ -552,8 +568,6 @@ def _fetch_gemini_cloudcode() -> ProviderQuota | None:
     data = gemini_cloudcode.cloudcode_format_json()
     if not data.get("ok"):
         error = data.get("error")
-        if error in {"auth", "missing_token"}:
-            return None
         return {"cloudcode": True, "cloudcode_error": error if isinstance(error, str) else "unknown"}
 
     result: ProviderQuota = {"cloudcode": True}
@@ -635,18 +649,52 @@ def _fetch_gemini() -> ProviderQuota | None:
     # Never merge source results: the same quota pool may be present in both
     # structured responses and the partial TUI viewport. Strict precedence
     # avoids double-counting while retaining each source as a fallback.
-    agy_api = _fetch_gemini_agy_api()
+    auth_failure: ProviderQuota | None = None
+    fallback_error: ProviderQuota | None = None
+
+    try:
+        agy_api = _fetch_gemini_agy_api()
+    except urllib.error.HTTPError:
+        # Agy's cached keyring token may simply have expired between app
+        # refreshes. Treat that as this source being temporarily unavailable,
+        # not as evidence that the user's Gemini credentials were revoked.
+        agy_api = None
     if agy_api is not None:
         return agy_api
+
     cloudcode = _fetch_gemini_cloudcode()
     if cloudcode is not None and "cloudcode_error" not in cloudcode:
         return cloudcode
-    agy_scrape = _fetch_gemini_agy()
-    if agy_scrape is not None:
-        return agy_scrape
-    probe = _fetch_gemini_probe()
+    if cloudcode is not None:
+        cloudcode_error = _provider_result_auth_error_type("gemini", cloudcode)
+        if cloudcode_error == "auth":
+            auth_failure = cloudcode
+        elif cloudcode_error != "missing_token":
+            fallback_error = cloudcode
+
+    if auth_failure is None:
+        agy_scrape = _fetch_gemini_agy()
+        if agy_scrape is not None:
+            return agy_scrape
+
+    try:
+        probe = _fetch_gemini_probe()
+    except (OSError, TimeoutError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        if auth_failure is not None:
+            return auth_failure
+        raise
     if probe is not None:
-        return probe
+        if _provider_result_is_authenticated_success("gemini", probe):
+            return probe
+        if _provider_result_auth_error_type("gemini", probe) == "auth":
+            auth_failure = probe
+        elif auth_failure is None:
+            return probe
+
+    if auth_failure is not None:
+        return auth_failure
+    if fallback_error is not None:
+        return fallback_error
     return cloudcode
 
 
@@ -750,7 +798,6 @@ def _mark_provider_error(provider: ProviderName, error_type: str, *, http_status
             _cache[provider] = None
             _mark_provider_credentials_available(provider)
         elif error_type == "missing_token":
-            _reset_auth_failures(provider)
             _cache[provider] = None
             _cache["missing_credentials"].add(provider)
         else:
@@ -767,7 +814,6 @@ def _store_provider_result(provider: ProviderName, result: ProviderQuota | None)
         if result is None:
             _cache[provider] = None
             _cache["stale"].add(provider)
-            _reset_auth_failures(provider)
             _cache["missing_credentials"].add(provider)
             _cache["next_retry"][provider] = now + AUTH_RETRY_TTL
         else:
@@ -782,7 +828,6 @@ def _store_provider_result(provider: ProviderName, result: ProviderQuota | None)
                 _cache["next_retry"][provider] = now + AUTH_RETRY_TTL
             elif result_error_type == "missing_token":
                 _record_error({"provider": provider, "type": "missing_token", "timestamp": now})
-                _reset_auth_failures(provider)
                 _cache[provider] = None
                 _cache["stale"].add(provider)
                 _cache["missing_credentials"].add(provider)
@@ -943,7 +988,7 @@ def _render_gemini(data: ProviderQuota | None, is_stale: bool) -> str:
         if data is None and cloudcode_login_pending():
             return f"🟡 {short}:LOGIN..."
         return f"🔴 {short}:?"
-    if data.get("cloudcode"):
+    if data.get("cloudcode") or data.get("agy_scrape"):
         error = data.get("cloudcode_error")
         if error in {"auth", "forbidden"}:
             return f"🔴 {short}:AUTH"

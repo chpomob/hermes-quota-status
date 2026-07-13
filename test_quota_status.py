@@ -1249,6 +1249,34 @@ class HermesQuotaStatusTests(unittest.TestCase):
         self.assertEqual(result["available_models"], ["gemini-2.5-flash"])
         self.assertEqual(result["probe"], {"status": 200})
 
+    def test_fetch_gemini_cloudcode_preserves_auth_failure_type(self) -> None:
+        with patch.object(self.plugin.gemini_cloudcode, "cloudcode_token_exists", return_value=True), patch.object(
+            self.plugin.gemini_cloudcode,
+            "cloudcode_format_json",
+            return_value={"ok": False, "error": "auth", "models": []},
+        ):
+            result = self.plugin._fetch_gemini_cloudcode()
+
+        self.assertEqual(result, {"cloudcode": True, "cloudcode_error": "auth"})
+
+    def test_fetch_gemini_agy_api_propagates_auth_http_error(self) -> None:
+        for status in (401, 403):
+            auth_error = urllib.error.HTTPError(
+                "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                status,
+                "authentication failed",
+                {},
+                None,
+            )
+            with self.subTest(status=status), patch.object(
+                self.plugin,
+                "_agy_api_fetch_models",
+                side_effect=auth_error,
+            ), self.assertRaises(urllib.error.HTTPError) as raised:
+                self.plugin._fetch_gemini_agy_api()
+
+            self.assertEqual(raised.exception.code, status)
+
     def test_fetch_gemini_cloudcode_maps_best_remaining_fraction(self) -> None:
         with patch.object(self.plugin.gemini_cloudcode, "cloudcode_token_exists", return_value=True), patch.object(
             self.plugin.gemini_cloudcode,
@@ -1781,21 +1809,21 @@ class HermesQuotaStatusTests(unittest.TestCase):
 
                 self.assertEqual(self.plugin._auth_failure_counts["claude"], 2)
 
-    def test_missing_credentials_reset_auth_failure_counter(self) -> None:
-        self.plugin._auth_failure_counts["claude"] = 2
+    def test_missing_credentials_leave_auth_failure_counter_unchanged(self) -> None:
+        self.plugin._auth_failure_counts["gemini"] = 2
 
         with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
             self.plugin._PROVIDERS,
-            {"claude": MagicMock(return_value=None)},
+            {"gemini": MagicMock(return_value=None)},
             clear=True,
         ):
-            self.plugin._refresh_cache(("claude",))
+            self.plugin._refresh_cache(("gemini",))
 
-        self.assertEqual(self.plugin._auth_failure_counts["claude"], 0)
-        self.assertIsNone(self.plugin._cache["claude"])
-        self.assertEqual(self.plugin._cache["next_retry"]["claude"], 200.0 + self.plugin.AUTH_RETRY_TTL)
+        self.assertEqual(self.plugin._auth_failure_counts["gemini"], 2)
+        self.assertIsNone(self.plugin._cache["gemini"])
+        self.assertEqual(self.plugin._cache["next_retry"]["gemini"], 200.0 + self.plugin.AUTH_RETRY_TTL)
 
-    def test_missing_credentials_unsuppress_previously_auth_failed_provider(self) -> None:
+    def test_missing_credentials_do_not_unsuppress_previously_auth_failed_provider(self) -> None:
         self.plugin._auth_failure_counts["gemini"] = self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD
 
         with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
@@ -1808,8 +1836,111 @@ class HermesQuotaStatusTests(unittest.TestCase):
         with patch.object(self.plugin, "_start_refresh_if_needed"):
             rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["gemini"]}})
 
+        self.assertEqual(
+            self.plugin._auth_failure_counts["gemini"],
+            self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD,
+        )
+        self.assertIsNone(rendered)
+
+    def test_gemini_agy_api_expired_token_uses_scrape_without_incrementing_counter(self) -> None:
+        agy_auth_error = urllib.error.HTTPError(
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            401,
+            "unauthorized",
+            {},
+            None,
+        )
+        scrape_result = {
+            "agy_scrape": True,
+            "remaining_fraction": 0.8,
+            "model_count": 1,
+            "groups": [{"label": "3F", "remaining": 0.8, "used_pct": 20, "reset": "", "model_count": 1}],
+        }
+
+        with (
+            patch.object(self.plugin.time, "time", return_value=200.0),
+            patch.object(self.plugin, "_fetch_gemini_agy_api", side_effect=agy_auth_error),
+            patch.object(self.plugin, "_fetch_gemini_cloudcode", return_value=None),
+            patch.object(self.plugin, "_fetch_gemini_agy", return_value=scrape_result),
+            patch.object(self.plugin, "_fetch_gemini_probe", return_value=None),
+            patch.dict(self.plugin._PROVIDERS, {"gemini": self.plugin._fetch_gemini}, clear=True),
+        ):
+            self.plugin._refresh_cache(("gemini",))
+
         self.assertEqual(self.plugin._auth_failure_counts["gemini"], 0)
-        self.assertEqual(rendered, "🔴 Ge:?")
+        self.assertEqual(self.plugin._cache["gemini"], scrape_result)
+
+    def test_gemini_cloudcode_auth_failure_increments_counter(self) -> None:
+        with (
+            patch.object(self.plugin.time, "time", return_value=200.0),
+            patch.object(self.plugin, "_fetch_gemini_agy_api", return_value=None),
+            patch.object(
+                self.plugin,
+                "_fetch_gemini_cloudcode",
+                return_value={"cloudcode": True, "cloudcode_error": "auth"},
+            ),
+            patch.object(self.plugin, "_fetch_gemini_agy") as scrape,
+            patch.object(self.plugin, "_fetch_gemini_probe", return_value=None),
+            patch.dict(self.plugin._PROVIDERS, {"gemini": self.plugin._fetch_gemini}, clear=True),
+        ):
+            self.plugin._refresh_cache(("gemini",))
+
+        self.assertEqual(self.plugin._auth_failure_counts["gemini"], 1)
+        scrape.assert_not_called()
+
+    def test_gemini_authenticated_cloudcode_success_overrides_agy_api_auth_failure(self) -> None:
+        agy_auth_error = urllib.error.HTTPError(
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            401,
+            "unauthorized",
+            {},
+            None,
+        )
+        cloudcode_success = {
+            "cloudcode": True,
+            "remaining_fraction": 0.75,
+            "model_count": 1,
+            "groups": [{"label": "3F", "remaining": 0.75, "used_pct": 25, "reset": "", "model_count": 1}],
+        }
+        self.plugin._auth_failure_counts["gemini"] = 2
+
+        with (
+            patch.object(self.plugin.time, "time", return_value=200.0),
+            patch.object(self.plugin, "_fetch_gemini_agy_api", side_effect=agy_auth_error),
+            patch.object(self.plugin, "_fetch_gemini_cloudcode", return_value=cloudcode_success),
+            patch.object(self.plugin, "_fetch_gemini_agy") as scrape,
+            patch.dict(self.plugin._PROVIDERS, {"gemini": self.plugin._fetch_gemini}, clear=True),
+        ):
+            self.plugin._refresh_cache(("gemini",))
+
+        self.assertEqual(self.plugin._auth_failure_counts["gemini"], 0)
+        self.assertEqual(self.plugin._cache["gemini"], cloudcode_success)
+        self.assertEqual(self.plugin._render_provider("gemini", self.plugin._cache["gemini"], False), "🟢 Ge:25%")
+        scrape.assert_not_called()
+
+    def test_gemini_scrape_success_is_neutral_for_auth_failure_counter(self) -> None:
+        scrape_result = {
+            "agy_scrape": True,
+            "remaining_fraction": 0.7,
+            "model_count": 1,
+            "groups": [{"label": "3F", "remaining": 0.7, "used_pct": 30, "reset": "", "model_count": 1}],
+        }
+        self.plugin._auth_failure_counts["gemini"] = 2
+
+        with (
+            patch.object(self.plugin.time, "time", return_value=200.0),
+            patch.object(self.plugin, "_fetch_gemini_agy_api", return_value=None),
+            patch.object(self.plugin, "_fetch_gemini_cloudcode", return_value=None),
+            patch.object(self.plugin, "_fetch_gemini_agy", return_value=scrape_result),
+            patch.object(self.plugin, "_fetch_gemini_probe") as probe,
+            patch.dict(self.plugin._PROVIDERS, {"gemini": self.plugin._fetch_gemini}, clear=True),
+        ):
+            self.plugin._refresh_cache(("gemini",))
+
+        self.assertEqual(self.plugin._auth_failure_counts["gemini"], 2)
+        self.assertEqual(self.plugin._cache["gemini"], scrape_result)
+        self.assertEqual(self.plugin._render_provider("gemini", scrape_result, False), "🟢 Ge:30%")
+        probe.assert_not_called()
 
     def test_gemini_invalid_api_key_counts_toward_auth_suppression(self) -> None:
         invalid_key_result = {
