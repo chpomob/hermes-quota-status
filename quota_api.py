@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import ssl
 import time
@@ -171,14 +172,14 @@ def json_number(value: Any) -> float:
 def json_number_or_none(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
-    if isinstance(value, int | float):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError:
+    try:
+        if isinstance(value, int | float | str):
+            number = float(value)
+        else:
             return None
-    return None
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _format_money_amount(value: float) -> str:

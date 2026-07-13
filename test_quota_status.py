@@ -145,6 +145,25 @@ def load_quota_api() -> ModuleType:
     return module
 
 
+class QuotaApiNumberValidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.quota_api = load_quota_api()
+
+    def test_json_number_or_none_rejects_non_finite_json_numbers(self) -> None:
+        for raw_value in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(raw_value=raw_value):
+                parsed_value = json.loads(raw_value)
+                self.assertIsNone(self.quota_api.json_number_or_none(parsed_value))
+
+    def test_json_number_or_none_rejects_non_finite_numeric_strings(self) -> None:
+        for value in ("NaN", "Infinity", "-Infinity", "1e10000"):
+            with self.subTest(value=value):
+                self.assertIsNone(self.quota_api.json_number_or_none(value))
+
+    def test_json_number_or_none_rejects_integer_too_large_for_float(self) -> None:
+        self.assertIsNone(self.quota_api.json_number_or_none(10**400))
+
+
 class PluginMetadataTests(unittest.TestCase):
     def test_plugin_metadata_documents_v2_providers_and_config_surface(self) -> None:
         plugin = load_plugin()
