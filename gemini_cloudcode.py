@@ -27,8 +27,11 @@ from typing import Any, Final, Literal
 # OAuth flow. Installed-app client secrets are distributed with the client and
 # therefore are not confidential by design. These remain a third party's
 # credentials, so reuse may be subject to Google's terms of service.
-CLIENT_ID: Final[str] = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-CLIENT_SECRET: Final[str] = "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"
+# Override via GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET env vars.
+_CLIENT_ID_DEFAULT: Final[str] = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+_CLIENT_SECRET_DEFAULT: Final[str] = "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"
+CLIENT_ID: Final[str] = os.environ.get("GOOGLE_CLIENT_ID", _CLIENT_ID_DEFAULT)
+CLIENT_SECRET: Final[str] = os.environ.get("GOOGLE_CLIENT_SECRET", _CLIENT_SECRET_DEFAULT)
 AUTH_URL: Final[str] = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL: Final[str] = "https://oauth2.googleapis.com/token"
 LOAD_CODE_ASSIST_URL: Final[str] = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
