@@ -23,6 +23,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Final, Literal
 
+# Google's published installed-app credentials for the Cloud Code / gemini-cli
+# OAuth flow. Installed-app client secrets are distributed with the client and
+# therefore are not confidential by design. These remain a third party's
+# credentials, so reuse may be subject to Google's terms of service.
 CLIENT_ID: Final[str] = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 CLIENT_SECRET: Final[str] = "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"
 AUTH_URL: Final[str] = "https://accounts.google.com/o/oauth2/v2/auth"
