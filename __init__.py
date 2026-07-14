@@ -1496,7 +1496,14 @@ def _display_width(text: str) -> int:
 
 
 def _trim_status_parts_for_width(parts: list[str], terminal_width: int | None) -> str | None:
-    if terminal_width is None:
+    """Join complete segments, trimming only for the narrow-terminal contract.
+
+    Hermes asks plugins to constrain their contribution when the terminal is at
+    most 60 columns wide. Wider (and unknown-width) renders must retain every
+    segment; in the narrow case we only remove whole trailing segments so a
+    separator or future control sequence can never be sliced in half.
+    """
+    if terminal_width is None or terminal_width > NARROW_TERMINAL_WIDTH_LIMIT:
         return STATUS_SEGMENT_SEPARATOR.join(parts)
 
     selected: list[str] = []

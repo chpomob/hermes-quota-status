@@ -44,7 +44,10 @@ ACCEPTANCE_COVERAGE: dict[str, tuple[str, ...]] = {
     "AC15": ("test_render_reset_countdown_is_relative_without_absolute_timestamp",),
     "AC16": ("test_render_current_and_expired_resets_as_zero_countdown",),
     "AC17": ("test_render_width_60_trims_to_limit",),
-    "AC18": ("test_render_width_60_trims_at_well_formed_segment_boundaries",),
+    "AC18": (
+        "test_render_width_60_trims_at_well_formed_segment_boundaries",
+        "test_render_width_60_drops_whole_next_segment_after_stale_segments",
+    ),
     "AC19": (
         "test_auth_failure_suppresses_provider_after_third_consecutive_failure",
         "test_public_render_drives_suppression_background_refresh_and_recovery",
@@ -81,6 +84,7 @@ ACCEPTANCE_COVERAGE: dict[str, tuple[str, ...]] = {
     "AC28": ("test_render_codex_dual_and_single_windows",),
     "AC29": ("test_render_provider_allowlist_is_case_sensitive",),
     "AC30": (
+        "test_render_width_61_does_not_trim",
         "test_render_width_above_60_does_not_apply_fixed_60_character_cap",
         "test_render_missing_width_does_not_apply_60_character_cap",
     ),
@@ -113,6 +117,7 @@ ACCEPTANCE_IDS_BY_TEST_METHOD: dict[str, tuple[str, ...]] = {
     "test_render_current_and_expired_resets_as_zero_countdown": ("AC16", "AC24"),
     "test_render_width_60_trims_to_limit": ("AC17", "AC24"),
     "test_render_width_60_trims_at_well_formed_segment_boundaries": ("AC18",),
+    "test_render_width_60_drops_whole_next_segment_after_stale_segments": ("AC18",),
     "test_auth_failure_suppresses_provider_after_third_consecutive_failure": ("AC19", "AC24"),
     "test_auth_failure_suppression_is_independent_per_provider": ("AC20",),
     "test_suppression_recovery_renders_provider_after_successful_refresh": ("AC21", "AC24"),
@@ -129,6 +134,7 @@ ACCEPTANCE_IDS_BY_TEST_METHOD: dict[str, tuple[str, ...]] = {
     "test_fetch_glm_quota_uses_glm_api_key_header_when_both_credentials_are_set": ("AC25",),
     "test_render_glm_uses_quota_data_from_fallback_host": ("AC26",),
     "test_render_provider_allowlist_is_case_sensitive": ("AC29",),
+    "test_render_width_61_does_not_trim": ("AC30",),
     "test_render_width_above_60_does_not_apply_fixed_60_character_cap": ("AC30",),
     "test_render_missing_width_does_not_apply_60_character_cap": ("AC30",),
     "test_v2_provider_identity_order_and_cache_initialization": ("AC31",),
@@ -3011,15 +3017,49 @@ class HermesQuotaStatusTests(unittest.TestCase):
             ["🟡 C:5h:24% 7d:61%", "🟡 Cx:P:22% S:63%"],
         )
 
-    def test_render_width_61_trims_to_reported_width(self) -> None:
+    def test_render_width_60_drops_whole_next_segment_after_stale_segments(self) -> None:
+        self._seed_wide_provider_cache()
+        self.plugin._cache["stale"].update(("claude", "codex"))
+
+        with patch.object(self.plugin, "_start_refresh_if_needed"):
+            untrimmed = self.plugin.on_status_bar_render()
+            rendered = self.plugin.on_status_bar_render({"terminal_width": 60})
+
+        self.assertIsNotNone(untrimmed)
+        self.assertGreater(self.plugin._display_width(untrimmed), 60)
+        self.assertEqual(
+            rendered,
+            "🟡 C:5h:24% 7d:61% (stale) │ 🟡 Cx:P:22% S:63% (stale)",
+        )
+        self.assertLessEqual(self.plugin._display_width(rendered), 60)
+        next_segment = self.plugin._render_provider("gemini", self.plugin._cache["gemini"], False)
+        boundary_candidate = self.plugin.STATUS_SEGMENT_SEPARATOR.join((rendered, next_segment))
+        self.assertLessEqual(
+            self.plugin._display_width(rendered + self.plugin.STATUS_SEGMENT_SEPARATOR), 60
+        )
+        self.assertGreater(self.plugin._display_width(boundary_candidate), 60)
+        self.assertEqual(
+            rendered.split(self.plugin.STATUS_SEGMENT_SEPARATOR),
+            [
+                "🟡 C:5h:24% 7d:61% (stale)",
+                "🟡 Cx:P:22% S:63% (stale)",
+            ],
+        )
+        self.assertFalse(rendered.startswith(self.plugin.STATUS_SEGMENT_SEPARATOR))
+        self.assertFalse(rendered.endswith(self.plugin.STATUS_SEGMENT_SEPARATOR))
+
+    def test_render_width_61_does_not_trim(self) -> None:
         self._seed_wide_provider_cache()
 
         with patch.object(self.plugin, "_start_refresh_if_needed"):
             rendered = self.plugin.on_status_bar_render({"terminal_width": 61})
 
         self.assertIsNotNone(rendered)
-        self.assertLessEqual(self.plugin._display_width(rendered), 61)
-        self.assertEqual(rendered, "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63%")
+        self.assertGreater(self.plugin._display_width(rendered), 61)
+        self.assertEqual(
+            rendered,
+            "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28% │ 🟢 D:$3.50",
+        )
 
     def test_render_width_above_60_does_not_apply_fixed_60_character_cap(self) -> None:
         self._seed_wide_provider_cache()
@@ -3028,11 +3068,10 @@ class HermesQuotaStatusTests(unittest.TestCase):
             rendered = self.plugin.on_status_bar_render({"terminal_width": 80})
 
         self.assertIsNotNone(rendered)
-        self.assertGreater(self.plugin._display_width(rendered), 60)
-        self.assertLessEqual(self.plugin._display_width(rendered), 80)
+        self.assertGreater(self.plugin._display_width(rendered), 80)
         self.assertEqual(
             rendered,
-            "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28%",
+            "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28% │ 🟢 D:$3.50",
         )
 
     def test_render_too_narrow_for_first_segment_returns_none(self) -> None:
