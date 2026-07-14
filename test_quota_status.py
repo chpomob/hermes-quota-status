@@ -77,6 +77,7 @@ ACCEPTANCE_COVERAGE: dict[str, tuple[str, ...]] = {
         "test_auth_failure_suppresses_provider_after_third_consecutive_failure",
         "test_non_auth_failures_leave_auth_failure_counter_unchanged",
         "test_suppression_recovery_renders_provider_after_successful_refresh",
+        "test_public_render_drives_suppression_background_refresh_and_recovery",
     ),
     "AC25": ("test_fetch_glm_quota_uses_glm_api_key_header_when_both_credentials_are_set",),
     "AC26": ("test_render_glm_uses_quota_data_from_fallback_host",),
@@ -125,6 +126,7 @@ ACCEPTANCE_IDS_BY_TEST_METHOD: dict[str, tuple[str, ...]] = {
         "AC19",
         "AC20",
         "AC21",
+        "AC24",
         "AC32",
     ),
     "test_acceptance_claude_codex_and_gemini_render_one_segment_each_when_available": ("AC22",),
@@ -146,6 +148,20 @@ ACCEPTANCE_IDS_BY_TEST_METHOD: dict[str, tuple[str, ...]] = {
 
 def acceptance_ids_from_spec() -> set[str]:
     return set(re.findall(r"^- (AC\d+) \(", SPEC_PATH.read_text(encoding="utf-8"), flags=re.MULTILINE))
+
+
+def requirement_ids_from_spec() -> set[str]:
+    return set(re.findall(r"^- (R\d+):", SPEC_PATH.read_text(encoding="utf-8"), flags=re.MULTILINE))
+
+
+def acceptance_requirements_from_spec() -> dict[str, str]:
+    return dict(
+        re.findall(
+            r"^- (AC\d+) \((R\d+)\):",
+            SPEC_PATH.read_text(encoding="utf-8"),
+            flags=re.MULTILINE,
+        )
+    )
 
 
 def load_plugin() -> ModuleType:
@@ -388,9 +404,9 @@ class PluginMetadataTests(unittest.TestCase):
             self.assertIn(provider_display_name, description)
 
         self.assertIn("quota_status.providers", description)
-        self.assertIn("case-sensitive provider names", description)
+        self.assertIn("Valid case-sensitive values for quota_status.providers", description)
         documented_provider_names = (
-            description.split("Valid case-sensitive provider names are ", 1)[1]
+            description.split("Valid case-sensitive values for quota_status.providers are ", 1)[1]
             .rstrip(".")
             .replace(", and ", ", ")
             .split(", ")
@@ -425,6 +441,34 @@ class AcceptanceCoverageAuditTests(unittest.TestCase):
                 self.assertLessEqual(set(acceptance_ids), expected_ids)
                 for acceptance_id in acceptance_ids:
                     self.assertIn(method_name, ACCEPTANCE_COVERAGE[acceptance_id])
+
+    def test_each_observable_requirement_has_an_existing_automated_test(self) -> None:
+        all_requirement_ids = requirement_ids_from_spec()
+        observable_requirement_ids = {f"R{number}" for number in range(1, 20)}
+        self.assertEqual(all_requirement_ids, observable_requirement_ids | {"R20"})
+
+        acceptance_requirements = acceptance_requirements_from_spec()
+        self.assertEqual(set(acceptance_requirements), set(ACCEPTANCE_COVERAGE))
+
+        test_methods = {
+            method_name
+            for obj in globals().values()
+            if isinstance(obj, type) and issubclass(obj, unittest.TestCase)
+            for method_name in obj.__dict__
+            if method_name.startswith("test_")
+        }
+        coverage_by_requirement: dict[str, set[str]] = {
+            requirement_id: set() for requirement_id in observable_requirement_ids
+        }
+        for acceptance_id, method_names in ACCEPTANCE_COVERAGE.items():
+            requirement_id = acceptance_requirements[acceptance_id]
+            if requirement_id in coverage_by_requirement:
+                coverage_by_requirement[requirement_id].update(method_names)
+
+        for requirement_id, method_names in coverage_by_requirement.items():
+            with self.subTest(requirement_id=requirement_id):
+                self.assertTrue(method_names)
+                self.assertLessEqual(method_names, test_methods)
 
 
 class QuotaApiDeepSeekTests(unittest.TestCase):
