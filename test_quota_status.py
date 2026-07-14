@@ -1420,7 +1420,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
         self.assertEqual(self.plugin._cache["next_retry"]["claude"], 200.0 + self.plugin.AUTH_RETRY_TTL)
         self.assertEqual(self.plugin._cache["next_retry"]["codex"], 200.0 + self.plugin.CACHE_TTL)
 
-    def test_refreshing_is_reset_after_unexpected_provider_exception(self) -> None:
+    def test_provider_claim_is_released_after_unexpected_provider_exception(self) -> None:
         with patch.object(self.plugin.time, "time", return_value=200.0), patch.dict(
             self.plugin._PROVIDERS,
             {"claude": MagicMock(side_effect=OverflowError("bad epoch"))},
@@ -1428,11 +1428,11 @@ class HermesQuotaStatusTests(unittest.TestCase):
         ):
             self.plugin._refresh_cache()
 
-        self.assertFalse(self.plugin._cache["refreshing"])
+        self.assertNotIn("claude", self.plugin._refresh_claims)
         self.assertIn("claude", self.plugin._cache["stale"])
         self.assertEqual(self.plugin._cache["next_retry"]["claude"], 200.0 + self.plugin.ERROR_RETRY_TTL)
 
-    def test_thread_start_failure_clears_refresh_lock(self) -> None:
+    def test_thread_start_failure_releases_unstarted_provider_claims(self) -> None:
         fake_thread = MagicMock()
         fake_thread.start.side_effect = RuntimeError("thread failed")
 
@@ -1440,7 +1440,133 @@ class HermesQuotaStatusTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.plugin._start_refresh_if_needed(self.plugin.PROVIDERS)
 
-        self.assertFalse(self.plugin._cache["refreshing"])
+        self.assertEqual(self.plugin._refresh_claims, {})
+
+    def test_blocked_gemini_refresh_does_not_block_glm_or_deepseek(self) -> None:
+        release_gemini = self.plugin.threading.Event()
+        gemini_started = self.plugin.threading.Event()
+        gemini_finished = self.plugin.threading.Event()
+        glm_finished = self.plugin.threading.Event()
+        deepseek_finished = self.plugin.threading.Event()
+        glm_result = {"available_limit_pct": 72.0}
+        deepseek_result = {"is_available": True, "balance": 4.25, "currency": "USD"}
+
+        def blocked_gemini_fetch():
+            gemini_started.set()
+            release_gemini.wait(timeout=3)
+            gemini_finished.set()
+            return {"key_valid": True, "model_count": 1}
+
+        def glm_fetch():
+            glm_finished.set()
+            return glm_result
+
+        def deepseek_fetch():
+            deepseek_finished.set()
+            return deepseek_result
+
+        with patch.dict(
+            self.plugin._PROVIDERS,
+            {"gemini": blocked_gemini_fetch, "glm": glm_fetch, "deepseek": deepseek_fetch},
+            clear=True,
+        ):
+            try:
+                self.plugin._start_refresh_if_needed(("gemini", "glm", "deepseek"))
+                self.assertTrue(gemini_started.wait(timeout=1))
+                self.assertTrue(glm_finished.wait(timeout=1))
+                self.assertTrue(deepseek_finished.wait(timeout=1))
+                deadline = time.monotonic() + 1
+                while (
+                    (self.plugin._cache["glm"] != glm_result or self.plugin._cache["deepseek"] != deepseek_result)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                self.assertEqual(self.plugin._cache["glm"], glm_result)
+                self.assertEqual(self.plugin._cache["deepseek"], deepseek_result)
+                self.assertIn("gemini", self.plugin._refresh_claims)
+            finally:
+                release_gemini.set()
+                self.assertTrue(gemini_finished.wait(timeout=1))
+
+    def test_expired_claim_is_reclaimed_and_stale_generation_result_is_discarded(self) -> None:
+        release_first = self.plugin.threading.Event()
+        first_started = self.plugin.threading.Event()
+        first_finished = self.plugin.threading.Event()
+        fetch_lock = self.plugin.threading.Lock()
+        fetch_count = 0
+        old_result = {"key_valid": False, "auth_error": True, "available_models": ["old"], "model_count": 1}
+        new_result = {"key_valid": True, "available_models": ["new"], "model_count": 1}
+
+        def fetch_gemini():
+            nonlocal fetch_count
+            with fetch_lock:
+                fetch_count += 1
+                generation_call = fetch_count
+            if generation_call == 1:
+                first_started.set()
+                release_first.wait(timeout=3)
+                first_finished.set()
+                return old_result
+            return new_result
+
+        with patch.dict(self.plugin._PROVIDERS, {"gemini": fetch_gemini}, clear=True):
+            try:
+                with patch.object(self.plugin.time, "time", return_value=100.0):
+                    self.plugin._start_refresh_if_needed(("gemini",))
+                self.assertTrue(first_started.wait(timeout=1))
+
+                reclaim_time = 100.0 + self.plugin.REFRESH_CLAIM_TTL
+                with patch.object(self.plugin.time, "time", return_value=reclaim_time):
+                    self.plugin._start_refresh_if_needed(("gemini",))
+
+                deadline = time.monotonic() + 1
+                while self.plugin._cache["gemini"] != new_result and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(self.plugin._cache["gemini"], new_result)
+                self.assertEqual(self.plugin._refresh_generations["gemini"], 2)
+            finally:
+                release_first.set()
+                self.assertTrue(first_finished.wait(timeout=1))
+
+        self.assertEqual(self.plugin._cache["gemini"], new_result)
+        self.assertEqual(self.plugin._auth_failure_counts["gemini"], 0)
+        self.assertFalse(any(error["provider"] == "gemini" for error in self.plugin._last_errors))
+        self.assertNotIn("gemini", self.plugin._refresh_claims)
+
+    def test_concurrent_provider_auth_failures_update_independent_suppression_counters(self) -> None:
+        failure_barrier = self.plugin.threading.Barrier(2, timeout=2)
+
+        def auth_failure_fetch():
+            failure_barrier.wait()
+            raise urllib.error.HTTPError("https://example.test", 401, "unauthorized", {}, None)
+
+        with self.plugin._cache_lock:
+            self.plugin._auth_failure_counts["claude"] = self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD - 1
+            self.plugin._auth_failure_counts["codex"] = self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD - 1
+
+        with patch.dict(
+            self.plugin._PROVIDERS,
+            {"claude": auth_failure_fetch, "codex": auth_failure_fetch},
+            clear=True,
+        ):
+            self.plugin._start_refresh_if_needed(("claude", "codex"))
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                counts = self.plugin._auth_failure_counts_snapshot()
+                if (
+                    counts["claude"] == self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD
+                    and counts["codex"] == self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD
+                ):
+                    break
+                time.sleep(0.01)
+
+        counts = self.plugin._auth_failure_counts_snapshot()
+        self.assertEqual(counts["claude"], self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD)
+        self.assertEqual(counts["codex"], self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD)
+        self.assertTrue(self.plugin._provider_auth_suppressed("claude", counts))
+        self.assertTrue(self.plugin._provider_auth_suppressed("codex", counts))
+        self.assertNotIn("claude", self.plugin._refresh_claims)
+        self.assertNotIn("codex", self.plugin._refresh_claims)
 
     def test_fmt_reset_edge_cases(self) -> None:
         self.assertEqual(self.plugin._fmt_reset(""), "?")

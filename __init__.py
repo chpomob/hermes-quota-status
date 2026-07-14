@@ -100,6 +100,11 @@ CACHE_TTL: Final[int] = 120
 ERROR_RETRY_TTL: Final[int] = 30
 AUTH_RETRY_TTL: Final[int] = 300
 AUTH_FAILURE_SUPPRESSION_THRESHOLD: Final[int] = 3
+# Longer than the expected successful provider fetch path, but finite so a
+# worker stuck in an OS, keyring, or network call cannot suppress that provider
+# indefinitely. A reclaimed worker may still return; its generation token is
+# checked before every state mutation below.
+REFRESH_CLAIM_TTL: Final[int] = 60
 AGY_AUTH_HTTP_STATUSES: Final[frozenset[int]] = frozenset({401, 403})
 CREDENTIAL_REQUIRED_OMIT_PROVIDERS: Final[tuple[ProviderName, ...]] = ("glm", "deepseek")
 
@@ -221,7 +226,6 @@ class CacheState(TypedDict):
     glm: ProviderQuota | None
     deepseek: ProviderQuota | None
     ts: float
-    refreshing: bool
     stale: set[ProviderName]
     missing_credentials: set[ProviderName]
     next_retry: dict[ProviderName, float]
@@ -234,6 +238,11 @@ class ProviderError(TypedDict):
     http_status: NotRequired[int]
 
 
+class RefreshClaim(TypedDict):
+    generation: int
+    claimed_at: float
+
+
 _cache: CacheState = {
     "claude": None,
     "codex": None,
@@ -241,7 +250,6 @@ _cache: CacheState = {
     "glm": None,
     "deepseek": None,
     "ts": 0.0,
-    "refreshing": False,
     "stale": set(),
     "missing_credentials": set(),
     "next_retry": {provider: 0.0 for provider in PROVIDERS},
@@ -253,6 +261,8 @@ _cache: CacheState = {
 _cache_lock = threading.RLock()
 _last_errors: list[ProviderError] = []
 _auth_failure_counts: dict[ProviderName, int] = {provider: 0 for provider in PROVIDERS}
+_refresh_claims: dict[ProviderName, RefreshClaim] = {}
+_refresh_generations: dict[ProviderName, int] = {provider: 0 for provider in PROVIDERS}
 
 QUOTA_WINDOW_SPECS: Final[dict[ProviderName, tuple[QuotaWindowSpec, ...]]] = {
     "claude": (
@@ -785,23 +795,63 @@ def _due_providers(now: float, providers: tuple[ProviderName, ...] = PROVIDERS) 
     )
 
 
-def _claim_refresh(now: float, providers: tuple[ProviderName, ...] = PROVIDERS) -> tuple[ProviderName, ...]:
+def _claim_refresh(
+    now: float,
+    providers: tuple[ProviderName, ...] = PROVIDERS,
+    *,
+    force: bool = False,
+) -> dict[ProviderName, int]:
+    """Claim each eligible provider independently and return generation tokens.
+
+    ``force`` preserves the synchronous helper's historical behavior for tests
+    and explicit callers. It bypasses retry backoff, but never an unexpired
+    in-flight claim.
+    """
     with _cache_lock:
-        if _cache["refreshing"]:
-            return ()
-        due = _due_providers(now, providers)
-        if due:
-            _cache["refreshing"] = True
-        return due
+        claimed: dict[ProviderName, int] = {}
+        for provider in dict.fromkeys(providers):
+            if provider not in _PROVIDERS:
+                continue
+            if not force and now < _cache["next_retry"].get(provider, 0.0):
+                continue
+
+            active_claim = _refresh_claims.get(provider)
+            if active_claim is not None and now - active_claim["claimed_at"] < REFRESH_CLAIM_TTL:
+                continue
+
+            generation = _refresh_generations.get(provider, 0) + 1
+            _refresh_generations[provider] = generation
+            _refresh_claims[provider] = {"generation": generation, "claimed_at": now}
+            claimed[provider] = generation
+        return claimed
 
 
-def _mark_provider_error(provider: ProviderName, error_type: str, *, http_status: int | None = None) -> None:
+def _claim_is_current_locked(provider: ProviderName, generation: int) -> bool:
+    claim = _refresh_claims.get(provider)
+    return claim is not None and claim["generation"] == generation
+
+
+def _release_refresh_claim(provider: ProviderName, generation: int) -> None:
+    with _cache_lock:
+        if _claim_is_current_locked(provider, generation):
+            del _refresh_claims[provider]
+
+
+def _mark_provider_error(
+    provider: ProviderName,
+    error_type: str,
+    generation: int,
+    *,
+    http_status: int | None = None,
+) -> bool:
     now = time.time()
     error: ProviderError = {"provider": provider, "type": error_type, "timestamp": now}
     if http_status is not None:
         error["http_status"] = http_status
 
     with _cache_lock:
+        if not _claim_is_current_locked(provider, generation):
+            return False
         _record_error(error)
         _cache["ts"] = now
         _cache["stale"].add(provider)
@@ -817,11 +867,14 @@ def _mark_provider_error(provider: ProviderName, error_type: str, *, http_status
         _cache["next_retry"][provider] = now + _retry_ttl(error_type)
 
     logger.warning("quota refresh failed", extra={"quota_error": error})
+    return True
 
 
-def _store_provider_result(provider: ProviderName, result: ProviderQuota | None) -> None:
+def _store_provider_result(provider: ProviderName, result: ProviderQuota | None, generation: int) -> bool:
     now = time.time()
     with _cache_lock:
+        if not _claim_is_current_locked(provider, generation):
+            return False
         _cache["ts"] = now
         if result is None:
             _cache[provider] = None
@@ -849,60 +902,91 @@ def _store_provider_result(provider: ProviderName, result: ProviderQuota | None)
                 _cache["next_retry"][provider] = now + CACHE_TTL
             else:
                 _cache["next_retry"][provider] = now + CACHE_TTL
+    return True
+
+
+def _refresh_provider(provider: ProviderName, generation: int) -> None:
+    """Fetch one provider without holding the cache lock."""
+    try:
+        fetcher = _PROVIDERS.get(provider)
+        if fetcher is None:
+            return
+        try:
+            result = fetcher()
+        except urllib.error.HTTPError as exc:
+            auth_statuses = GEMINI_AUTH_HTTP_STATUSES if provider == "gemini" else (401, 403)
+            error_type = "auth" if exc.code in auth_statuses else "http"
+            accepted = _mark_provider_error(provider, error_type, generation, http_status=exc.code)
+            if not accepted:
+                logger.debug(
+                    "discarded stale quota refresh failure for %s generation %s",
+                    provider,
+                    generation,
+                    exc_info=True,
+                )
+            return
+        except (OSError, TimeoutError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            accepted = _mark_provider_error(provider, type(exc).__name__, generation)
+            if not accepted:
+                logger.debug(
+                    "discarded stale quota refresh failure for %s generation %s",
+                    provider,
+                    generation,
+                    exc_info=True,
+                )
+            return
+        except Exception as exc:
+            accepted = _mark_provider_error(provider, type(exc).__name__, generation)
+            if accepted:
+                logger.warning("unexpected quota refresh failure", exc_info=True)
+            else:
+                logger.debug(
+                    "discarded stale quota refresh failure for %s generation %s",
+                    provider,
+                    generation,
+                    exc_info=True,
+                )
+            return
+
+        if result is None:
+            _mark_provider_error(provider, "missing_token", generation)
+        else:
+            _store_provider_result(provider, result, generation)
+    finally:
+        _release_refresh_claim(provider, generation)
 
 
 def _refresh_cache(due_providers: tuple[ProviderName, ...] | None = None) -> None:
-    if due_providers is None:
-        due_providers = _claim_refresh(time.time())
-    if not due_providers:
-        return
-
-    try:
-        for provider in due_providers:
-            fetcher = _PROVIDERS.get(provider)
-            if fetcher is None:
-                continue
-            try:
-                result = fetcher()
-            except urllib.error.HTTPError as exc:
-                auth_statuses = GEMINI_AUTH_HTTP_STATUSES if provider == "gemini" else (401, 403)
-                error_type = "auth" if exc.code in auth_statuses else "http"
-                _mark_provider_error(provider, error_type, http_status=exc.code)
-                continue
-            except (OSError, TimeoutError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-                _mark_provider_error(provider, type(exc).__name__)
-                continue
-            except Exception as exc:
-                _mark_provider_error(provider, type(exc).__name__)
-                logger.warning("unexpected quota refresh failure", exc_info=True)
-                continue
-
-            if result is None:
-                _mark_provider_error(provider, "missing_token")
-            else:
-                _store_provider_result(provider, result)
-    finally:
-        with _cache_lock:
-            _cache["refreshing"] = False
+    """Synchronously refresh providers; production rendering uses per-provider threads."""
+    claims = _claim_refresh(
+        time.time(),
+        due_providers if due_providers is not None else PROVIDERS,
+        force=due_providers is not None,
+    )
+    for provider, generation in claims.items():
+        _refresh_provider(provider, generation)
 
 
 def _start_refresh_if_needed(providers: tuple[ProviderName, ...]) -> None:
-    due_providers = _claim_refresh(time.time(), providers)
-    if not due_providers:
+    claims = _claim_refresh(time.time(), providers)
+    if not claims:
         return
 
-    try:
-        thread = _refresh_thread_factory(
-            target=_refresh_cache,
-            args=(due_providers,),
-            name="hermes-quota-refresh",
-            daemon=True,
-        )
-        thread.start()
-    except Exception:
-        with _cache_lock:
-            _cache["refreshing"] = False
-        raise
+    pending_claims = dict(claims)
+    for provider, generation in claims.items():
+        try:
+            thread = _refresh_thread_factory(
+                target=_refresh_provider,
+                args=(provider, generation),
+                name=f"hermes-quota-refresh-{provider}",
+                daemon=True,
+            )
+            thread.start()
+            pending_claims.pop(provider)
+        except Exception:
+            for pending_provider, pending_generation in pending_claims.items():
+                _release_refresh_claim(pending_provider, pending_generation)
+            raise
 
 
 def _now_utc() -> datetime:
