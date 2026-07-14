@@ -19,7 +19,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final, Literal, NotRequired, TypeAlias, TypedDict, cast
 
@@ -386,14 +386,37 @@ def _short_model_name(model_id: str) -> str:
     return f"{version}{suffix}"[:6]
 
 
-def _fmt_reset_hours(iso_str: str) -> str:
-    """Format reset time as '+Nh' or '' if missing/empty."""
-    if not iso_str:
+_AGY_RESET_DELTA_RE: Final[re.Pattern[str]] = re.compile(r"^\+(?P<hours>\d+)h$")
+
+
+def _agy_reset_iso(value: Any, scraped_at: datetime) -> str:
+    """Convert Agy's relative whole-hour reset to an ISO timestamp.
+
+    Agy's scraper normally supplies an integer hour count, while older callers
+    may supply its ``+Nh`` display form. Fixing the timestamp at scrape time
+    introduces at most the cache TTL's drift and keeps ``reset_iso`` strictly
+    ISO-or-empty for every downstream parser and countdown formatter.
+    """
+    if isinstance(value, bool):
         return ""
-    hours = gemini_cloudcode._hours_until(iso_str)
-    if hours is None or hours <= 0:
+    if isinstance(value, int):
+        delta = f"+{value}h"
+    elif isinstance(value, str):
+        delta = value
+    else:
         return ""
-    return f"+{hours}h"
+
+    match = _AGY_RESET_DELTA_RE.fullmatch(delta)
+    if match is None:
+        return ""
+    try:
+        hours = int(match.group("hours"))
+        if hours <= 0:
+            return ""
+        reset_at = scraped_at + timedelta(hours=hours)
+    except (OverflowError, ValueError):
+        return ""
+    return reset_at.isoformat().replace("+00:00", "Z")
 
 
 def _call_with_deadline(callback: Callable[[], Any], timeout: float) -> Any | None:
@@ -576,16 +599,21 @@ def _fetch_gemini_agy() -> ProviderQuota | None:
         models = agy_quota.fetch_agy_quota()
         if models:
             gemini_models = [model for model in models if model.get("provider") == "gemini"]
-            # Group models by (used_pct, reset_hours) — same pool
-            pool_groups: dict[tuple[int, int], list[dict[str, Any]]] = {}
+            # A relative reset is anchored once per scrape. This deliberately
+            # fixes the clock until the cache refreshes rather than allowing
+            # non-ISO display strings to leak into the reset_iso contract.
+            scraped_at = _now_utc()
+            # Group models by (used_pct, reset_iso) — same pool.
+            pool_groups: dict[tuple[int, str], list[dict[str, Any]]] = {}
             for m in gemini_models:
-                key = (m["used_pct"], m["reset_hours"])
+                reset_iso = _agy_reset_iso(m.get("reset_hours"), scraped_at)
+                key = (m["used_pct"], reset_iso)
                 if key not in pool_groups:
                     pool_groups[key] = []
                 pool_groups[key].append(m)
 
             groups: list[GroupInfo] = []
-            for (used_pct, reset_hours), model_list in pool_groups.items():
+            for (used_pct, reset_iso), model_list in pool_groups.items():
                 remaining = 1.0 - (used_pct / 100.0)
                 # Pick the best label from the group
                 label = _agy_model_label(model_list[0]["name"])
@@ -593,7 +621,7 @@ def _fetch_gemini_agy() -> ProviderQuota | None:
                     "label": label,
                     "remaining": remaining,
                     "used_pct": used_pct,
-                    "reset": f"+{reset_hours}h" if reset_hours else "",
+                    "reset": reset_iso,
                     "model_count": len(model_list),
                 })
 
@@ -1142,13 +1170,9 @@ def _fmt_reset(iso_str: Any) -> str:
     return f"{minutes // 60}h{minutes % 60}m"
 
 
-def _fmt_hours_until(iso_str: str) -> str:
-    """Format a reset timestamp as whole hours from now; return '?' for invalid values."""
-    dt = gemini_cloudcode.parse_reset_time(iso_str)
-    if dt is None:
-        return "?"
-    seconds = (dt - datetime.now(timezone.utc)).total_seconds()
-    return f"{max(0, int(round(seconds / 3600)))}h"
+def _fmt_hours_until(iso_str: Any) -> str:
+    """Alias for the canonical relative countdown formatter."""
+    return _fmt_reset(iso_str)
 
 
 def _fmt_pct(pct: float) -> str:

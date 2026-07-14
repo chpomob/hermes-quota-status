@@ -1289,6 +1289,57 @@ class HermesQuotaStatusTests(unittest.TestCase):
         self.assertTrue(rendered.startswith("🟢 Ge:10%"), rendered)
         self.assertNotIn("🔴", rendered)
 
+    def test_fetch_gemini_agy_converts_relative_reset_to_iso_countdown(self) -> None:
+        base = datetime(2026, 6, 2, 14, 0, tzinfo=timezone.utc)
+        models = [
+            {
+                "provider": "gemini",
+                "name": "Gemini 3.5 Flash (Medium)",
+                "remaining_pct": 0.0,
+                "used_pct": 100,
+                "reset_hours": 3,
+            },
+            {
+                "provider": "gemini",
+                "name": "Gemini 3.5 Pro (High)",
+                "remaining_pct": 0.0,
+                "used_pct": 100,
+                "reset_hours": "+3h",
+            },
+        ]
+
+        with patch.object(self.plugin.agy_quota, "fetch_agy_quota", return_value=models), patch.object(
+            self.plugin, "_now_utc", return_value=base
+        ):
+            result = self.plugin._fetch_gemini_agy()
+
+        self.assertIsNotNone(result)
+        reset_iso = result["reset_iso"]
+        self.assertEqual(datetime.fromisoformat(reset_iso), base + timedelta(hours=3))
+        self.assertEqual(result["model_count"], 2)
+        self.assertEqual(len(result["groups"]), 1)
+        self.assertEqual(result["groups"][0]["reset"], reset_iso)
+        with patch.object(self.plugin, "_now_utc", return_value=base):
+            self.assertEqual(self.plugin._fmt_reset(reset_iso), "3h0m")
+            self.assertEqual(self.plugin._fmt_hours_until(reset_iso), "3h0m")
+
+    def test_fetch_gemini_agy_omits_malformed_relative_reset(self) -> None:
+        models = [{
+            "provider": "gemini",
+            "name": "Gemini 3.5 Flash (Medium)",
+            "remaining_pct": 0.0,
+            "used_pct": 100,
+            "reset_hours": "+soon",
+        }]
+
+        with patch.object(self.plugin.agy_quota, "fetch_agy_quota", return_value=models):
+            result = self.plugin._fetch_gemini_agy()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["reset_iso"], "")
+        self.assertEqual(result["groups"][0]["reset"], "")
+        self.assertEqual(self.plugin._render_provider("gemini", result, False), "🔴 Ge:100%")
+
     def test_fetch_gemini_prefers_structured_agy_api_over_partial_scrape(self) -> None:
         structured_result = {
             "cloudcode": True,
