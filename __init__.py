@@ -28,6 +28,7 @@ try:
     from . import agy_quota
     from .quota_api import (
         GEMINI_AUTH_HTTP_STATUSES,
+        MAX_RESPONSE_BYTES,
         fetch_claude_quota,
         fetch_codex_quota,
         fetch_deepseek_balance,
@@ -50,6 +51,7 @@ except ImportError:
     import agy_quota  # type: ignore[no-redef]
     from quota_api import (  # type: ignore[no-redef]
         GEMINI_AUTH_HTTP_STATUSES,
+        MAX_RESPONSE_BYTES,
         fetch_claude_quota,
         fetch_codex_quota,
         fetch_deepseek_balance,
@@ -383,9 +385,9 @@ def _fmt_reset_hours(iso_str: str) -> str:
 def _agy_api_fetch_models() -> dict[str, Any] | None:
     """Fetch model data from daily-cloudcode-pa using agy's keyring token.
 
-    Returns the structured API response with displayNames. Returns None when
-    the keyring token is unavailable or a non-authentication API call fails;
-    HTTP 401/403 errors are propagated so the source coordinator can fall back.
+    Returns the structured API response with display names. Returns None when
+    the keyring token is unavailable or the API returns a non-auth HTTP error.
+    Authentication, transport, and malformed-body errors are propagated.
     """
     try:
         import gi
@@ -411,27 +413,36 @@ def _agy_api_fetch_models() -> dict[str, Any] | None:
 
         if not agy_token:
             return None
+    except Exception:
+        logger.debug("agy keyring lookup failed", exc_info=True)
+        return None
 
-        url = "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
-        req = urllib.request.Request(
-            url, data=b"{}",
-            headers={
-                "Authorization": f"Bearer {agy_token}",
-                "Content-Type": "application/json",
-                "User-Agent": "antigravity",
-            },
-            method="POST",
-        )
-        resp = urllib.request.urlopen(req, timeout=8, context=ssl.create_default_context())
-        return json.loads(resp.read())
+    url = "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+    req = urllib.request.Request(
+        url, data=b"{}",
+        headers={
+            "Authorization": f"Bearer {agy_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "antigravity",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8, context=ssl.create_default_context()) as resp:
+            data = resp.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         logger.debug("agy API fetch failed", exc_info=True)
         if exc.code in AGY_AUTH_HTTP_STATUSES:
             raise
         return None
-    except Exception:
-        logger.debug("agy API fetch failed", exc_info=True)
-        return None
+
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise ValueError("Agy API response too large")
+
+    payload = json.loads(data)
+    if not isinstance(payload, dict):
+        raise ValueError("Agy API response is not a JSON object")
+    return payload
 
 
 def _fetch_gemini_agy() -> ProviderQuota | None:
@@ -484,9 +495,9 @@ def _fetch_gemini_agy() -> ProviderQuota | None:
 def _fetch_gemini_agy_api() -> ProviderQuota | None:
     """Fetch Gemini quota from Agy's structured daily Cloud Code API.
 
-    Returns None when no structured quota is available. HTTP 401/403 errors
-    from agy's keyring credential are propagated so callers can use another
-    source without attributing the failure to Cloud Code credentials.
+    Returns None when no structured quota is available. Authentication,
+    transport, and malformed-response errors are propagated so the refresh
+    coordinator can classify them without discarding retained quota data.
     """
 
     try:
@@ -542,6 +553,7 @@ def _fetch_gemini_agy_api() -> ProviderQuota | None:
         return None
     except Exception:
         logger.debug("agy API fetch failed", exc_info=True)
+        raise
 
     return None
 

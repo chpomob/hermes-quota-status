@@ -4,6 +4,7 @@ import importlib.util
 import json
 import re
 import socket
+import sys
 import subprocess
 import tempfile
 import time
@@ -187,6 +188,30 @@ class SynchronousThread:
 
     def start(self) -> None:
         self._target(*self._args, **self._kwargs)
+
+
+class ContextManagedResponse:
+    """HTTP response double that records bounded reads and context cleanup."""
+
+    def __init__(self, body: bytes = b"", read_error: Exception | None = None) -> None:
+        self.body = body
+        self.read_error = read_error
+        self.read_sizes: list[int] = []
+        self.entered = False
+        self.closed = False
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        self.closed = True
+
+    def read(self, size: int) -> bytes:
+        self.read_sizes.append(size)
+        if self.read_error is not None:
+            raise self.read_error
+        return self.body[:size]
 
 
 class AgyQuotaTests(unittest.TestCase):
@@ -955,6 +980,44 @@ class HermesQuotaStatusTests(unittest.TestCase):
     def setUp(self) -> None:
         self.plugin = load_plugin()
 
+    def _agy_keyring_modules(self):
+        secret_value = MagicMock()
+        secret_value.get_text.return_value = json.dumps(
+            {"token": {"access_token": "agy-access-token"}}
+        )
+        item = MagicMock()
+        item.get_label.return_value = "antigravity"
+        item.retrieve_secret_sync.return_value = secret_value
+        collection = MagicMock()
+        collection.get_items.return_value = [item]
+        service = MagicMock()
+        service.get_collections.return_value = [collection]
+
+        secret_api = MagicMock()
+        secret_api.ServiceFlags.OPEN_SESSION = 1
+        secret_api.ServiceFlags.LOAD_COLLECTIONS = 2
+        secret_api.Service.get_sync.return_value = service
+        repository_module = ModuleType("gi.repository")
+        repository_module.Secret = secret_api
+        gi_module = ModuleType("gi")
+        gi_module.require_version = MagicMock()
+        return patch.dict(
+            sys.modules,
+            {"gi": gi_module, "gi.repository": repository_module},
+        )
+
+    def _agy_json_body(self, size: int) -> bytes:
+        empty_body = json.dumps(
+            {"models": {}, "padding": ""}, separators=(",", ":")
+        ).encode("utf-8")
+        padding_size = size - len(empty_body)
+        if padding_size < 0:
+            raise ValueError("requested Agy test body is too small")
+        return json.dumps(
+            {"models": {}, "padding": "x" * padding_size},
+            separators=(",", ":"),
+        ).encode("utf-8")
+
     def _render_with_synchronous_refresh(
         self, providers: tuple[str, ...], *, now: float
     ) -> str | None:
@@ -1300,6 +1363,85 @@ class HermesQuotaStatusTests(unittest.TestCase):
             result = self.plugin._fetch_gemini_cloudcode()
 
         self.assertEqual(result, {"cloudcode": True, "cloudcode_error": "auth"})
+
+    def test_agy_api_oversized_body_is_non_auth_and_retains_cache(self) -> None:
+        cached = {
+            "cloudcode": True,
+            "remaining_fraction": 0.65,
+            "model_count": 1,
+        }
+        self.plugin._cache["gemini"] = cached
+        self.plugin._auth_failure_counts["gemini"] = 2
+        capped_body = self._agy_json_body(self.plugin.MAX_RESPONSE_BYTES)
+        response = ContextManagedResponse(capped_body + b" ")
+
+        with (
+            self._agy_keyring_modules(),
+            patch.object(self.plugin.time, "sleep"),
+            patch.object(self.plugin.time, "time", return_value=200.0),
+            patch.object(
+                self.plugin.urllib.request, "urlopen", return_value=response
+            ),
+            patch.dict(
+                self.plugin._PROVIDERS,
+                {"gemini": self.plugin._fetch_gemini},
+                clear=True,
+            ),
+        ):
+            self.plugin._refresh_cache(("gemini",))
+
+        self.assertTrue(response.entered)
+        self.assertTrue(response.closed)
+        self.assertEqual(
+            response.read_sizes, [self.plugin.MAX_RESPONSE_BYTES + 1]
+        )
+        self.assertIs(self.plugin._cache["gemini"], cached)
+        self.assertIn("gemini", self.plugin._cache["stale"])
+        self.assertEqual(self.plugin._auth_failure_counts["gemini"], 2)
+        self.assertEqual(self.plugin._last_errors[-1]["type"], "ValueError")
+
+    def test_agy_api_body_exactly_at_cap_parses_and_closes_response(self) -> None:
+        body = self._agy_json_body(self.plugin.MAX_RESPONSE_BYTES)
+        response = ContextManagedResponse(body)
+
+        with (
+            self._agy_keyring_modules(),
+            patch.object(self.plugin.time, "sleep"),
+            patch.object(
+                self.plugin.urllib.request, "urlopen", return_value=response
+            ),
+        ):
+            result = self.plugin._agy_api_fetch_models()
+
+        self.assertEqual(len(body), self.plugin.MAX_RESPONSE_BYTES)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["models"], {})
+        self.assertTrue(response.entered)
+        self.assertTrue(response.closed)
+        self.assertEqual(
+            response.read_sizes, [self.plugin.MAX_RESPONSE_BYTES + 1]
+        )
+
+    def test_agy_api_mid_read_disconnect_closes_and_surfaces_transport_error(self) -> None:
+        transport_error = urllib.error.URLError("connection dropped")
+        response = ContextManagedResponse(read_error=transport_error)
+
+        with (
+            self._agy_keyring_modules(),
+            patch.object(self.plugin.time, "sleep"),
+            patch.object(
+                self.plugin.urllib.request, "urlopen", return_value=response
+            ),
+            self.assertRaises(urllib.error.URLError) as raised,
+        ):
+            self.plugin._fetch_gemini_agy_api()
+
+        self.assertIs(raised.exception, transport_error)
+        self.assertTrue(response.entered)
+        self.assertTrue(response.closed)
+        self.assertEqual(
+            response.read_sizes, [self.plugin.MAX_RESPONSE_BYTES + 1]
+        )
 
     def test_fetch_gemini_agy_api_propagates_auth_http_error(self) -> None:
         for status in (401, 403):
