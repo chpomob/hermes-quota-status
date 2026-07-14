@@ -1,6 +1,0 @@
-{
-  "phase": "write",
-  "exit_code": 0,
-  "commit_sha": "6de421fd7a053943fdc801b6d9d10dcabffe8098",
-  "stdout": "Wrote the complete specification to `spec.md` and verified the required structure and ID coverage."
-}

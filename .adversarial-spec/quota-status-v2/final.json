@@ -1,9 +1,0 @@
-{
-  "verdict": "APPROVED",
-  "reason": "",
-  "loops": 1,
-  "branch": "spec/quota-status-v2/1",
-  "merged": false,
-  "error": "",
-  "artifacts_dir": "/home/chpo/.hermes/plugins/hermes-quota-status/.adversarial-spec/quota-status-v2"
-}
