@@ -980,31 +980,201 @@ class HermesQuotaStatusTests(unittest.TestCase):
     def setUp(self) -> None:
         self.plugin = load_plugin()
 
-    def _agy_keyring_modules(self):
+    def _agy_keyring_item(self, payload, *, label="antigravity", attributes=None):
         secret_value = MagicMock()
-        secret_value.get_text.return_value = json.dumps(
-            {"token": {"access_token": "agy-access-token"}}
+        secret_value.get_text.return_value = (
+            payload if isinstance(payload, str) else json.dumps(payload)
         )
         item = MagicMock()
-        item.get_label.return_value = "antigravity"
+        item.get_attributes.return_value = attributes or {}
+        item.get_label.return_value = label
         item.retrieve_secret_sync.return_value = secret_value
+        return item
+
+    def _agy_keyring_modules_for_items(self, items, *, get_sync_side_effect=None):
         collection = MagicMock()
-        collection.get_items.return_value = [item]
+        collection.get_items.return_value = items
         service = MagicMock()
         service.get_collections.return_value = [collection]
 
         secret_api = MagicMock()
         secret_api.ServiceFlags.OPEN_SESSION = 1
         secret_api.ServiceFlags.LOAD_COLLECTIONS = 2
-        secret_api.Service.get_sync.return_value = service
+        if get_sync_side_effect is None:
+            secret_api.Service.get_sync.return_value = service
+        else:
+            secret_api.Service.get_sync.side_effect = get_sync_side_effect
         repository_module = ModuleType("gi.repository")
         repository_module.Secret = secret_api
         gi_module = ModuleType("gi")
         gi_module.require_version = MagicMock()
-        return patch.dict(
+        modules = patch.dict(
             sys.modules,
             {"gi": gi_module, "gi.repository": repository_module},
         )
+        return modules, secret_api
+
+    def _agy_keyring_modules(self):
+        modules, _secret_api = self._agy_keyring_modules_for_items(
+            [
+                self._agy_keyring_item(
+                    {"token": {"access_token": "agy-access-token"}}
+                )
+            ]
+        )
+        return modules
+
+    def test_agy_keyring_exact_attribute_match_returns_token(self) -> None:
+        item = self._agy_keyring_item(
+            {"token": {"access_token": "exact-token"}},
+            label="unrelated-label",
+            attributes={"service": "gemini", "username": "antigravity"},
+        )
+        modules, _secret_api = self._agy_keyring_modules_for_items([item])
+
+        with modules:
+            token = self.plugin._read_agy_keyring_token()
+
+        self.assertEqual(token, "exact-token")
+        item.retrieve_secret_sync.assert_called_once_with()
+
+    def test_agy_keyring_substring_label_is_not_a_match(self) -> None:
+        item = self._agy_keyring_item(
+            {"token": {"access_token": "wrong-token"}},
+            label="not-antigravity-backup",
+            attributes={"service": "gemini", "username": "someone-else"},
+        )
+        modules, _secret_api = self._agy_keyring_modules_for_items([item])
+
+        with modules:
+            token = self.plugin._read_agy_keyring_token()
+
+        self.assertIsNone(token)
+        item.retrieve_secret_sync.assert_not_called()
+
+    def test_agy_keyring_malformed_payloads_return_none(self) -> None:
+        malformed_payloads = (
+            [],
+            {},
+            {"token": []},
+            {"token": {}},
+            {"token": {"access_token": 123}},
+        )
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload):
+                item = self._agy_keyring_item(payload)
+                modules, _secret_api = self._agy_keyring_modules_for_items([item])
+                with modules:
+                    self.assertIsNone(self.plugin._read_agy_keyring_token())
+
+    def test_agy_keyring_service_lookup_obeys_deadline(self) -> None:
+        release_lookup = self.plugin.threading.Event()
+        modules, _secret_api = self._agy_keyring_modules_for_items(
+            [], get_sync_side_effect=lambda _flags: release_lookup.wait()
+        )
+
+        started_at = time.monotonic()
+        try:
+            with modules, patch.object(
+                self.plugin, "AGY_KEYRING_DEADLINE_SECONDS", 0.02
+            ):
+                self.assertIsNone(self.plugin._read_agy_keyring_token())
+        finally:
+            release_lookup.set()
+
+        self.assertLess(time.monotonic() - started_at, 0.5)
+
+    def test_agy_token_cache_avoids_second_keyring_lookup_within_ttl(self) -> None:
+        item = self._agy_keyring_item(
+            {"token": {"access_token": "cached-token"}}
+        )
+        modules, secret_api = self._agy_keyring_modules_for_items([item])
+
+        with modules:
+            self.assertEqual(self.plugin._get_agy_token(), "cached-token")
+            self.assertEqual(self.plugin._get_agy_token(), "cached-token")
+
+        secret_api.Service.get_sync.assert_called_once_with(3)
+        item.retrieve_secret_sync.assert_called_once_with()
+
+    def test_agy_token_cache_expiry_reloads_keyring_token(self) -> None:
+        item = self._agy_keyring_item(
+            {"token": {"access_token": "rotated-token"}}
+        )
+        modules, secret_api = self._agy_keyring_modules_for_items([item])
+
+        with modules, patch.object(
+            self.plugin, "AGY_TOKEN_CACHE_TTL", 10.0
+        ), patch.object(
+            self.plugin.time,
+            "monotonic",
+            side_effect=(0.0, 0.0, 11.0, 11.0),
+        ):
+            self.assertEqual(self.plugin._get_agy_token(), "rotated-token")
+            self.assertEqual(self.plugin._get_agy_token(), "rotated-token")
+
+        self.assertEqual(secret_api.Service.get_sync.call_count, 2)
+        self.assertEqual(item.retrieve_secret_sync.call_count, 2)
+
+    def test_agy_auth_failure_invalidates_cache_and_next_fetch_reads_keyring(self) -> None:
+        item = self._agy_keyring_item(
+            {"token": {"access_token": "cached-token"}}
+        )
+        modules, secret_api = self._agy_keyring_modules_for_items([item])
+        auth_error = urllib.error.HTTPError(
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            401,
+            "unauthorized",
+            {},
+            None,
+        )
+        response = ContextManagedResponse(b'{"models": {}}')
+
+        with modules, patch.object(
+            self.plugin.urllib.request,
+            "urlopen",
+            side_effect=(auth_error, response),
+        ):
+            with self.assertRaises(urllib.error.HTTPError):
+                self.plugin._agy_api_fetch_models()
+            result = self.plugin._agy_api_fetch_models()
+
+        self.assertEqual(result, {"models": {}})
+        self.assertEqual(secret_api.Service.get_sync.call_count, 2)
+        self.assertEqual(item.retrieve_secret_sync.call_count, 2)
+
+    def test_agy_token_invalidation_during_refill_does_not_restore_stale_token(self) -> None:
+        refill_started = self.plugin.threading.Event()
+        allow_refill = self.plugin.threading.Event()
+        results = []
+        errors = []
+
+        def blocked_read():
+            refill_started.set()
+            allow_refill.wait(timeout=1)
+            return "stale-token"
+
+        def refill():
+            try:
+                results.append(self.plugin._get_agy_token())
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch.object(
+            self.plugin, "_read_agy_keyring_token", side_effect=blocked_read
+        ):
+            thread = self.plugin.threading.Thread(target=refill, daemon=True)
+            thread.start()
+            self.assertTrue(refill_started.wait(timeout=1))
+            self.plugin._invalidate_agy_token_cache()
+            allow_refill.set()
+            thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [None])
+        self.assertIsNone(self.plugin._agy_token_cache)
+        self.assertEqual(self.plugin._agy_token_cache_expires_at, 0.0)
 
     def _agy_json_body(self, size: int) -> bytes:
         empty_body = json.dumps(

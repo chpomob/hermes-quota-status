@@ -108,6 +108,16 @@ AUTH_FAILURE_SUPPRESSION_THRESHOLD: Final[int] = 3
 # checked before every state mutation below.
 REFRESH_CLAIM_TTL: Final[int] = 60
 AGY_AUTH_HTTP_STATUSES: Final[frozenset[int]] = frozenset({401, 403})
+# Agy currently stores its keyring entry as service=gemini,
+# username=antigravity. Older Linux installs exposed only this exact label,
+# so retain it as a compatibility match without accepting substring lookalikes.
+AGY_KEYRING_ATTRIBUTES: Final[dict[str, str]] = {
+    "service": "gemini",
+    "username": "antigravity",
+}
+AGY_KEYRING_LEGACY_LABELS: Final[frozenset[str]] = frozenset({"antigravity"})
+AGY_KEYRING_DEADLINE_SECONDS: Final[float] = 1.0
+AGY_TOKEN_CACHE_TTL: Final[float] = 300.0
 CREDENTIAL_REQUIRED_OMIT_PROVIDERS: Final[tuple[ProviderName, ...]] = ("glm", "deepseek")
 
 logger = logging.getLogger(__name__)
@@ -265,6 +275,10 @@ _last_errors: list[ProviderError] = []
 _auth_failure_counts: dict[ProviderName, int] = {provider: 0 for provider in PROVIDERS}
 _refresh_claims: dict[ProviderName, RefreshClaim] = {}
 _refresh_generations: dict[ProviderName, int] = {provider: 0 for provider in PROVIDERS}
+_agy_token_cache_lock = threading.Lock()
+_agy_token_cache: str | None = None
+_agy_token_cache_expires_at = 0.0
+_agy_token_cache_generation = 0
 
 QUOTA_WINDOW_SPECS: Final[dict[ProviderName, tuple[QuotaWindowSpec, ...]]] = {
     "claude": (
@@ -382,6 +396,136 @@ def _fmt_reset_hours(iso_str: str) -> str:
     return f"+{hours}h"
 
 
+def _call_with_deadline(callback: Callable[[], Any], timeout: float) -> Any | None:
+    """Run a blocking callback off the caller thread and bound the wait.
+
+    Secret Service calls cannot be interrupted safely. A truly wedged call
+    therefore leaves one blocked daemon thread behind, but never blocks the
+    refresh worker or invokes libsecret on the GTK main loop.
+    """
+    completed = threading.Event()
+    result: list[Any] = []
+    error: list[Exception] = []
+
+    def run() -> None:
+        try:
+            result.append(callback())
+        except Exception as exc:
+            error.append(exc)
+        finally:
+            completed.set()
+
+    threading.Thread(target=run, name="hermes-agy-keyring", daemon=True).start()
+    if not completed.wait(max(0.0, timeout)):
+        logger.warning("agy keyring service lookup timed out")
+        return None
+    if error:
+        raise error[0]
+    return result[0] if result else None
+
+
+def _agy_keyring_item_matches(item: Any) -> bool:
+    """Match Agy credentials using the observed schema or legacy exact label."""
+    try:
+        attributes = item.get_attributes()
+    except Exception:
+        attributes = None
+    if isinstance(attributes, Mapping) and all(
+        attributes.get(key) == value for key, value in AGY_KEYRING_ATTRIBUTES.items()
+    ):
+        return True
+
+    try:
+        label = item.get_label()
+    except Exception:
+        return False
+    return isinstance(label, str) and label in AGY_KEYRING_LEGACY_LABELS
+
+
+def _agy_token_from_item(item: Any) -> str | None:
+    """Retrieve and validate an Agy token payload without leaking shape errors."""
+    try:
+        secret = item.retrieve_secret_sync()
+        if secret is None:
+            return None
+        text = secret.get_text()
+        if not isinstance(text, str):
+            return None
+        payload = json.loads(text)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    token = payload.get("token")
+    if not isinstance(token, dict):
+        return None
+    access_token = token.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        return None
+    return access_token
+
+
+def _read_agy_keyring_token() -> str | None:
+    """Read Agy's token from Secret Service, bounding service acquisition."""
+    try:
+        import gi
+        gi.require_version("Secret", "1")
+        from gi.repository import Secret
+
+        service = _call_with_deadline(
+            lambda: Secret.Service.get_sync(
+                Secret.ServiceFlags.OPEN_SESSION | Secret.ServiceFlags.LOAD_COLLECTIONS
+            ),
+            AGY_KEYRING_DEADLINE_SECONDS,
+        )
+        if service is None:
+            return None
+
+        for collection in service.get_collections():
+            for item in collection.get_items():
+                if not _agy_keyring_item_matches(item):
+                    continue
+                token = _agy_token_from_item(item)
+                if token is not None:
+                    return token
+    except Exception:
+        logger.debug("agy keyring lookup failed", exc_info=True)
+    return None
+
+
+def _get_agy_token() -> str | None:
+    """Return Agy's bounded-TTL cached token with race-safe refill."""
+    global _agy_token_cache, _agy_token_cache_expires_at
+
+    now = time.monotonic()
+    with _agy_token_cache_lock:
+        if _agy_token_cache is not None and now < _agy_token_cache_expires_at:
+            return _agy_token_cache
+        refill_generation = _agy_token_cache_generation
+
+    token = _read_agy_keyring_token()
+    if token is None:
+        return None
+
+    with _agy_token_cache_lock:
+        if refill_generation != _agy_token_cache_generation:
+            return None
+        _agy_token_cache = token
+        _agy_token_cache_expires_at = time.monotonic() + AGY_TOKEN_CACHE_TTL
+        return token
+
+
+def _invalidate_agy_token_cache() -> None:
+    """Invalidate cached and in-flight Agy tokens after authentication failure."""
+    global _agy_token_cache, _agy_token_cache_expires_at, _agy_token_cache_generation
+
+    with _agy_token_cache_lock:
+        _agy_token_cache_generation += 1
+        _agy_token_cache = None
+        _agy_token_cache_expires_at = 0.0
+
+
 def _agy_api_fetch_models() -> dict[str, Any] | None:
     """Fetch model data from daily-cloudcode-pa using agy's keyring token.
 
@@ -389,32 +533,8 @@ def _agy_api_fetch_models() -> dict[str, Any] | None:
     the keyring token is unavailable or the API returns a non-auth HTTP error.
     Authentication, transport, and malformed-body errors are propagated.
     """
-    try:
-        import gi
-        gi.require_version("Secret", "1")
-        from gi.repository import Secret
-
-        service = Secret.Service.get_sync(
-            Secret.ServiceFlags.OPEN_SESSION | Secret.ServiceFlags.LOAD_COLLECTIONS
-        )
-        import time
-        time.sleep(0.2)
-
-        agy_token = None
-        for col in service.get_collections():
-            for item in col.get_items():
-                if "antigravity" in item.get_label():
-                    secret = item.retrieve_secret_sync()
-                    if secret:
-                        agy_token = json.loads(secret.get_text())["token"]["access_token"]
-                        break
-            if agy_token:
-                break
-
-        if not agy_token:
-            return None
-    except Exception:
-        logger.debug("agy keyring lookup failed", exc_info=True)
+    agy_token = _get_agy_token()
+    if agy_token is None:
         return None
 
     url = "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
@@ -433,6 +553,7 @@ def _agy_api_fetch_models() -> dict[str, Any] | None:
     except urllib.error.HTTPError as exc:
         logger.debug("agy API fetch failed", exc_info=True)
         if exc.code in AGY_AUTH_HTTP_STATUSES:
+            _invalidate_agy_token_cache()
             raise
         return None
 
