@@ -28,10 +28,16 @@ from typing import Any, Final, Literal
 # therefore are not confidential by design. These remain a third party's
 # credentials, so reuse may be subject to Google's terms of service.
 # Override via GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET env vars.
-_CLIENT_ID_DEFAULT: Final[str] = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-_CLIENT_SECRET_DEFAULT: Final[str] = "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"
+_CLIENT_ID_DEFAULT: Final[str] = "1071006060591-...apps.googleusercontent.com"
+_CLIENT_SECRET_DEFAULT: Final[str] = "GOCSPX-..."
 CLIENT_ID: Final[str] = os.environ.get("GOOGLE_CLIENT_ID", _CLIENT_ID_DEFAULT)
 CLIENT_SECRET: Final[str] = os.environ.get("GOOGLE_CLIENT_SECRET", _CLIENT_SECRET_DEFAULT)
+# NOTE: Les vrais credentials Google Cloud Code sont stockés dans le fichier
+# d'installation gemini-cli ou gcloud. Remplacez les placeholders ci-dessus
+# par les valeurs réelles. Le plugin fonctionne sans : les credentials ne sont
+# nécessaires que pour le flux OAuth Gemini Cloud Code.
+# Ces credentials ne sont PAS personnels — ils sont distribués avec gcloud/gemini-cli,
+# mais par précaution, ils ne sont pas hardcodés ici.
 AUTH_URL: Final[str] = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL: Final[str] = "https://oauth2.googleapis.com/token"
 LOAD_CODE_ASSIST_URL: Final[str] = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
