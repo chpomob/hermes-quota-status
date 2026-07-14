@@ -1950,7 +1950,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
     def test_render_provider_thresholds_and_stale_states(self) -> None:
         cases = [
             (None, False, "🔴 C:?"),
-            ({"session_pct": 42.0, "reset_iso": ""}, True, "🔴 C:?"),
+            ({"session_pct": 42.0, "reset_iso": ""}, True, "🟢 C:42% (stale)"),
             ({"session_pct": 49.9, "reset_iso": ""}, False, "🟢 C:49%"),
             ({"session_pct": 50.0, "reset_iso": ""}, False, "🟡 C:50%"),
             ({"session_pct": 79.9, "reset_iso": ""}, False, "🟡 C:79%"),
@@ -1962,6 +1962,103 @@ class HermesQuotaStatusTests(unittest.TestCase):
         for data, stale, expected in cases:
             with self.subTest(data=data, stale=stale):
                 self.assertEqual(self.plugin._render_provider("claude", data, stale), expected)
+
+    def test_transient_errors_render_retained_values_as_stale_and_success_clears_marker(self) -> None:
+        cases = {
+            "claude": (
+                {"session_pct": 42.0, "reset_iso": ""},
+                {"session_pct": 18.0, "reset_iso": ""},
+                "🟢 C:42% (stale)",
+                "🟢 C:18%",
+            ),
+            "codex": (
+                {"session_pct": 42.0, "reset_iso": ""},
+                {"session_pct": 19.0, "reset_iso": ""},
+                "🟢 Cx:42% (stale)",
+                "🟢 Cx:19%",
+            ),
+            "gemini": (
+                {"key_valid": True, "probe": {"status": 200}},
+                {"key_valid": True, "probe": {"status": 403}},
+                "🟢 Ge:OK (stale)",
+                "🟡 Ge:403",
+            ),
+            "glm": (
+                {"session_pct": 28.0, "reset_iso": ""},
+                {"session_pct": 21.0, "reset_iso": ""},
+                "🟢 G:28% (stale)",
+                "🟢 G:21%",
+            ),
+            "deepseek": (
+                {"is_available": True, "currency": "USD", "balance": 3.5},
+                {"is_available": True, "currency": "USD", "balance": 4.5},
+                "🟢 D:$3.50 (stale)",
+                "🟢 D:$4.50",
+            ),
+        }
+
+        for provider, (cached, recovered, stale_segment, recovered_segment) in cases.items():
+            fetcher = MagicMock(
+                side_effect=(urllib.error.URLError("network unavailable"), recovered)
+            )
+            self.plugin._cache[provider] = cached
+
+            with self.subTest(provider=provider), patch.object(
+                self.plugin.time, "time", return_value=200.0
+            ), patch.dict(self.plugin._PROVIDERS, {provider: fetcher}, clear=True):
+                self.plugin._refresh_cache((provider,))
+                self.assertIs(self.plugin._cache[provider], cached)
+                self.assertIn(provider, self.plugin._cache["stale"])
+                self.assertEqual(
+                    self.plugin._render_provider(provider, self.plugin._cache[provider], True),
+                    stale_segment,
+                )
+                with patch.object(self.plugin, "_start_refresh_if_needed"):
+                    rendered = self.plugin.on_status_bar_render(
+                        {"quota_status": {"providers": [provider]}}
+                    )
+                self.assertEqual(rendered, stale_segment)
+
+                self.plugin._refresh_cache((provider,))
+                self.assertEqual(self.plugin._cache[provider], recovered)
+                self.assertNotIn(provider, self.plugin._cache["stale"])
+                self.assertEqual(
+                    self.plugin._render_provider(provider, self.plugin._cache[provider], False),
+                    recovered_segment,
+                )
+                with patch.object(self.plugin, "_start_refresh_if_needed"):
+                    rendered = self.plugin.on_status_bar_render(
+                        {"quota_status": {"providers": [provider]}}
+                    )
+                self.assertEqual(rendered, recovered_segment)
+
+    def test_transient_errors_without_retained_data_keep_existing_error_form(self) -> None:
+        for provider in self.plugin.PROVIDERS:
+            self.plugin._cache[provider] = None
+            self.plugin._cache["stale"].discard(provider)
+
+            with self.subTest(provider=provider), patch.object(
+                self.plugin.time, "time", return_value=200.0
+            ), patch.dict(
+                self.plugin._PROVIDERS,
+                {provider: MagicMock(side_effect=urllib.error.URLError("network unavailable"))},
+                clear=True,
+            ), patch.object(self.plugin, "cloudcode_login_pending", return_value=False):
+                self.plugin._refresh_cache((provider,))
+
+            self.assertIsNone(self.plugin._cache[provider])
+            self.assertIn(provider, self.plugin._cache["stale"])
+            self.assertEqual(
+                self.plugin._render_provider(provider, None, True),
+                f"🔴 {self.plugin.PROVIDER_SHORT[provider]}:?",
+            )
+            with patch.object(self.plugin, "_start_refresh_if_needed"), patch.object(
+                self.plugin, "cloudcode_login_pending", return_value=False
+            ):
+                rendered = self.plugin.on_status_bar_render(
+                    {"quota_status": {"providers": [provider]}}
+                )
+            self.assertEqual(rendered, f"🔴 {self.plugin.PROVIDER_SHORT[provider]}:?")
 
     def test_render_glm_success_uses_g_quota_segment(self) -> None:
         self.assertEqual(
@@ -2714,6 +2811,7 @@ class HermesQuotaStatusTests(unittest.TestCase):
     def test_suppressed_provider_is_still_scheduled_from_render(self) -> None:
         self.plugin._auth_failure_counts["claude"] = self.plugin.AUTH_FAILURE_SUPPRESSION_THRESHOLD
         self.plugin._cache["claude"] = {"session_pct": 18.0, "reset_iso": ""}
+        self.plugin._cache["stale"].add("claude")
 
         with patch.object(self.plugin, "_start_refresh_if_needed") as start_refresh:
             rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["claude"]}})

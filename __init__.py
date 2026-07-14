@@ -77,6 +77,7 @@ CONFIG_CONTAINER_KEYS: Final[tuple[str, ...]] = (
     "render_context",
 )
 STATUS_SEGMENT_SEPARATOR: Final[str] = " │ "
+STALE_MARKER: Final[str] = " (stale)"
 NARROW_TERMINAL_WIDTH_LIMIT: Final[int] = 60
 TERMINAL_WIDTH_KEYS: Final[tuple[str, ...]] = ("terminal_width", "terminal_columns", "columns", "width")
 TERMINAL_WIDTH_CONTAINER_KEYS: Final[tuple[str, ...]] = (
@@ -1208,9 +1209,14 @@ def _balance_display(data: ProviderQuota) -> str:
     return amount
 
 
-def _render_deepseek(data: ProviderQuota | None, is_stale: bool) -> str:
+def _with_stale_marker(segment: str, is_stale: bool) -> str:
+    """Identify retained quota values without replacing them with an error."""
+    return f"{segment}{STALE_MARKER}" if is_stale else segment
+
+
+def _render_deepseek_data(data: ProviderQuota | None) -> str:
     short = PROVIDER_SHORT["deepseek"]
-    if data is None or is_stale:
+    if data is None:
         return f"🔴 {short}:?"
 
     display = _balance_display(data)
@@ -1235,10 +1241,10 @@ def _render_balance_provider(short: str, data: ProviderQuota, unknown_status: st
     return f"🟢 {short}:{display}"
 
 
-def _render_gemini(data: ProviderQuota | None, is_stale: bool) -> str:
+def _render_gemini_data(data: ProviderQuota | None) -> str:
     short = PROVIDER_SHORT["gemini"]
-    if data is None or is_stale:
-        if data is None and cloudcode_login_pending():
+    if data is None:
+        if cloudcode_login_pending():
             return f"🟡 {short}:LOGIN..."
         return f"🔴 {short}:?"
     if data.get("cloudcode") or data.get("agy_scrape"):
@@ -1390,13 +1396,17 @@ def _render_quota_window(window: QuotaWindowInfo, include_label: bool) -> str:
 
 
 def _render_provider(provider: ProviderName, data: ProviderQuota | None, is_stale: bool) -> str:
+    return _with_stale_marker(_render_provider_data(provider, data), is_stale and data is not None)
+
+
+def _render_provider_data(provider: ProviderName, data: ProviderQuota | None) -> str:
     if provider == "gemini":
-        return _render_gemini(data, is_stale)
+        return _render_gemini_data(data)
     if provider == "deepseek":
-        return _render_deepseek(data, is_stale)
+        return _render_deepseek_data(data)
 
     short = PROVIDER_SHORT[provider]
-    if data is None or is_stale:
+    if data is None:
         return f"🔴 {short}:?"
     windows, has_explicit_windows = _quota_windows_for_render(provider, data)
     if not windows:
