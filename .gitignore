@@ -2,3 +2,4 @@
 .adversarial-loop/
 __pycache__/
 *.py[cod]
+findings.json
