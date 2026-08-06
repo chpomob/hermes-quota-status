@@ -398,7 +398,7 @@ class PluginMetadataTests(unittest.TestCase):
         metadata = yaml.safe_load(PLUGIN_METADATA_PATH.read_text(encoding="utf-8"))
 
         self.assertIsInstance(metadata, dict)
-        self.assertEqual(metadata["version"], "2.0.0")
+        self.assertEqual(metadata["version"], "2.0.1")
         description = metadata["description"]
         for provider_display_name in ("Claude", "Codex", "Gemini", "GLM/Zhipu", "DeepSeek"):
             self.assertIn(provider_display_name, description)
@@ -993,6 +993,27 @@ class QuotaApiGlmTests(unittest.TestCase):
         self.assertEqual(result["session_pct"], 16.0)
         self.assertEqual(result["session_reset"], "2026-05-03T14:47:11Z")
         self.assertEqual(result["reset_iso"], "2026-05-03T14:47:11Z")
+
+    def test_fetch_glm_quota_prefers_exhausted_token_pool_when_multiple_exist(self) -> None:
+        with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "glm-raw"}, clear=True), patch.object(
+            self.quota_api,
+            "fetch_json",
+            return_value={
+                "data": {
+                    "limits": [
+                        {"type": "TIME_LIMIT", "unit": 5, "percentage": 0, "nextResetTime": 1780336384978},
+                        {"type": "TOKENS_LIMIT", "unit": 3, "percentage": 0, "nextResetTime": 1777819631597},
+                        {"type": "TOKENS_LIMIT", "unit": 6, "percentage": 100, "nextResetTime": 1786154464998},
+                    ]
+                }
+            },
+        ):
+            result = self.quota_api.fetch_glm_quota()
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["session_pct"], 100.0)
+        self.assertEqual(result["session_reset"], "2026-08-08T02:01:04Z")
+        self.assertEqual(result["reset_iso"], "2026-08-08T02:01:04Z")
 
     def test_fetch_glm_quota_balance_only_leaves_percentage_unknown(self) -> None:
         with patch.dict(self.quota_api.os.environ, {"GLM_API_KEY": "glm-raw"}, clear=True), patch.object(

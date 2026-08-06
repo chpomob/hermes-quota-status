@@ -284,6 +284,20 @@ def _glm_quota_object_rank(data: dict[str, Any]) -> tuple[int, int] | None:
     return (3, 0)
 
 
+def _glm_used_pct(quota: dict[str, Any]) -> float:
+    """Best-effort used percentage for a GLM quota object; -1 when unknown."""
+    used = _percent_or_none(_find_direct_value(quota, GLM_USED_PCT_FIELDS))
+    if used is not None:
+        return used
+    available = _percent_or_none(_find_direct_value(quota, GLM_AVAILABLE_PCT_FIELDS))
+    if available is not None:
+        return 100.0 - available
+    fraction = _clamp_fraction(_find_direct_value(quota, GLM_REMAINING_FRACTION_FIELDS))
+    if fraction is not None:
+        return 100.0 - fraction * 100.0
+    return -1.0
+
+
 def _select_glm_quota_object(data: dict[str, Any]) -> dict[str, Any]:
     ranked: list[tuple[tuple[int, int], dict[str, Any]]] = []
     for index, obj in enumerate(_walk_json(data)):
@@ -292,6 +306,18 @@ def _select_glm_quota_object(data: dict[str, Any]) -> dict[str, Any]:
             ranked.append(((rank[0], index), obj))
     if not ranked:
         raise ValueError("GLM quota response did not include quota fields")
+
+    # Some plans (e.g. Z.AI lite) report several TOKENS_LIMIT pools (unit 3
+    # and unit 6) where unit 6 is the weekly/monthly coding pool that gates
+    # chat completions. The pool that blocks requests is the most consumed
+    # one, so when several token pools exist surface the highest used
+    # percentage — an exhausted weekly limit must not be masked by a fully
+    # available secondary pool. The legacy ranking still applies for
+    # single-pool responses and non-token fallbacks.
+    token_limits = [entry for entry in ranked if entry[0][0] <= 2]
+    if len(token_limits) > 1:
+        return max(token_limits, key=lambda entry: _glm_used_pct(entry[1]))[1]
+
     ranked.sort(key=lambda item: item[0])
     return ranked[0][1]
 

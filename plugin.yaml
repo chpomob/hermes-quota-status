@@ -1,5 +1,5 @@
 name: hermes-quota-status
-version: "2.0.0"
+version: "2.0.1"
 description: >-
   Supports Claude, Codex, Gemini, GLM/Zhipu, and DeepSeek quota usage in the
   Hermes status bar. Provider filtering is configured with the Hermes config
