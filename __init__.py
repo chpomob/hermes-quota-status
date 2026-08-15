@@ -120,6 +120,21 @@ AGY_KEYRING_LEGACY_LABELS: Final[frozenset[str]] = frozenset({"antigravity"})
 AGY_KEYRING_DEADLINE_SECONDS: Final[float] = 1.0
 AGY_TOKEN_CACHE_TTL: Final[float] = 300.0
 CREDENTIAL_REQUIRED_OMIT_PROVIDERS: Final[tuple[ProviderName, ...]] = ("glm", "deepseek")
+# DeepSeek switches from flat V4 pricing to peak/off-peak billing at
+# 16:00 UTC on 2026-08-16 (official pricing page). Peak windows are
+# 01:00-04:00 UTC and 06:00-10:00 UTC; every other hour is off-peak at
+# half the peak rate. Intervals are [start, end). Before the effective
+# date no phase applies (V4 was flat-priced), so the status bar shows
+# no phase icon until the scheduled card takes over.
+DEEPSEEK_PEAK_SCHEDULE_EFFECTIVE: Final[datetime] = datetime(
+    2026, 8, 16, 16, 0, tzinfo=timezone.utc
+)
+DEEPSEEK_PEAK_WINDOWS: Final[tuple[tuple[int, int], ...]] = ((1, 4), (6, 10))
+DEEPSEEK_PHASE_ICONS: Final[dict[str, str]] = {
+    "peak": "☀️",
+    "off-peak": "🌙",
+    "flat": "",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -1214,6 +1229,34 @@ def _with_stale_marker(segment: str, is_stale: bool) -> str:
     return f"{segment}{STALE_MARKER}" if is_stale else segment
 
 
+def _deepseek_rate_phase(now: datetime | None = None) -> tuple[str, str]:
+    """Return (phase, icon) for DeepSeek billing at ``now`` (UTC).
+
+    phase is ``"peak"``, ``"off-peak"``, or ``"flat"``. Flat covers the
+    period before the scheduled peak/off-peak card takes effect
+    (2026-08-16 16:00 UTC), when V4 rates were flat and no phase
+    applied; it carries an empty icon so the status bar simply omits the
+    phase marker. Peak windows are [01:00, 04:00) and [06:00, 10:00)
+    UTC; all other hours are off-peak at half the peak rate. A naive
+    ``now`` is assumed to be UTC.
+    """
+    now = now if now is not None else _now_utc()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    if now < DEEPSEEK_PEAK_SCHEDULE_EFFECTIVE:
+        phase = "flat"
+    else:
+        hour = now.hour
+        phase = (
+            "peak"
+            if any(start <= hour < end for start, end in DEEPSEEK_PEAK_WINDOWS)
+            else "off-peak"
+        )
+    return phase, DEEPSEEK_PHASE_ICONS[phase]
+
+
 def _render_deepseek_data(data: ProviderQuota | None) -> str:
     short = PROVIDER_SHORT["deepseek"]
     if data is None:
@@ -1223,11 +1266,12 @@ def _render_deepseek_data(data: ProviderQuota | None) -> str:
     if not display:
         return f"🟡 {short}:?"
 
+    _, phase_icon = _deepseek_rate_phase()
     balance = _first_balance_number(data)
     is_available = data.get("is_available")
     if is_available is False or (balance is not None and balance <= 0.0):
-        return f"🔴 {short}:{display}"
-    return f"🟢 {short}:{display}"
+        return f"🔴 {short}:{display}{phase_icon}"
+    return f"🟢 {short}:{display}{phase_icon}"
 
 
 def _render_balance_provider(short: str, data: ProviderQuota, unknown_status: str = "🟡") -> str:

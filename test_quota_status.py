@@ -2063,8 +2063,8 @@ class HermesQuotaStatusTests(unittest.TestCase):
             "deepseek": (
                 {"is_available": True, "currency": "USD", "balance": 3.5},
                 {"is_available": True, "currency": "USD", "balance": 4.5},
-                "🟢 D:$3.50 (stale)",
-                "🟢 D:$4.50",
+                "🟢 D:$3.50🌙 (stale)",
+                "🟢 D:$4.50🌙",
             ),
         }
 
@@ -2076,7 +2076,9 @@ class HermesQuotaStatusTests(unittest.TestCase):
 
             with self.subTest(provider=provider), patch.object(
                 self.plugin.time, "time", return_value=200.0
-            ), patch.dict(self.plugin._PROVIDERS, {provider: fetcher}, clear=True):
+            ), patch.dict(self.plugin._PROVIDERS, {provider: fetcher}, clear=True), patch.object(
+                self.plugin, "_deepseek_rate_phase", return_value=("off-peak", "🌙")
+            ):
                 self.plugin._refresh_cache((provider,))
                 self.assertIs(self.plugin._cache[provider], cached)
                 self.assertIn(provider, self.plugin._cache["stale"])
@@ -2170,35 +2172,99 @@ class HermesQuotaStatusTests(unittest.TestCase):
         )
 
     def test_render_deepseek_success_uses_balance_segment(self) -> None:
-        self.assertEqual(
-            self.plugin._render_provider(
-                "deepseek",
-                {
-                    "is_available": True,
-                    "currency": "USD",
-                    "balance": 3.5,
-                    "total_balance": 3.5,
-                    "total_balance_display": "3.50",
-                },
-                False,
-            ),
-            "🟢 D:$3.50",
-        )
+        with patch.object(self.plugin, "_deepseek_rate_phase", return_value=("off-peak", "🌙")):
+            self.assertEqual(
+                self.plugin._render_provider(
+                    "deepseek",
+                    {
+                        "is_available": True,
+                        "currency": "USD",
+                        "balance": 3.5,
+                        "total_balance": 3.5,
+                        "total_balance_display": "3.50",
+                    },
+                    False,
+                ),
+                "🟢 D:$3.50🌙",
+            )
 
     def test_render_deepseek_uses_granted_balance_when_total_is_missing(self) -> None:
-        self.assertEqual(
-            self.plugin._render_provider(
-                "deepseek",
-                {
-                    "is_available": True,
-                    "currency": "USD",
-                    "granted_balance": 5.0,
-                    "granted_balance_display": "5.00",
-                },
-                False,
-            ),
-            "🟢 D:$5.00",
+        with patch.object(self.plugin, "_deepseek_rate_phase", return_value=("off-peak", "🌙")):
+            self.assertEqual(
+                self.plugin._render_provider(
+                    "deepseek",
+                    {
+                        "is_available": True,
+                        "currency": "USD",
+                        "granted_balance": 5.0,
+                        "granted_balance_display": "5.00",
+                    },
+                    False,
+                ),
+                "🟢 D:$5.00🌙",
+            )
+
+    def test_deepseek_rate_phase_is_flat_before_scheduled_card(self) -> None:
+        before_effective = self.plugin.datetime(
+            2026, 8, 16, 15, 59, 59, tzinfo=self.plugin.timezone.utc
         )
+        self.assertEqual(self.plugin._deepseek_rate_phase(before_effective), ("flat", ""))
+
+    def test_deepseek_rate_phase_applies_at_effective_instant(self) -> None:
+        effective = self.plugin.datetime(2026, 8, 16, 16, 0, 0, tzinfo=self.plugin.timezone.utc)
+        self.assertEqual(self.plugin._deepseek_rate_phase(effective), ("off-peak", "🌙"))
+
+    def test_deepseek_rate_phase_peak_window_boundaries(self) -> None:
+        utc = self.plugin.timezone.utc
+        # [01:00, 04:00) UTC — start inclusive, end exclusive.
+        self.assertEqual(
+            self.plugin._deepseek_rate_phase(self.plugin.datetime(2026, 8, 17, 1, 0, tzinfo=utc)),
+            ("peak", "☀️"),
+        )
+        self.assertEqual(
+            self.plugin._deepseek_rate_phase(self.plugin.datetime(2026, 8, 17, 3, 59, tzinfo=utc)),
+            ("peak", "☀️"),
+        )
+        self.assertEqual(
+            self.plugin._deepseek_rate_phase(self.plugin.datetime(2026, 8, 17, 4, 0, tzinfo=utc)),
+            ("off-peak", "🌙"),
+        )
+        # [06:00, 10:00) UTC — second peak window.
+        self.assertEqual(
+            self.plugin._deepseek_rate_phase(self.plugin.datetime(2026, 8, 17, 6, 0, tzinfo=utc)),
+            ("peak", "☀️"),
+        )
+        self.assertEqual(
+            self.plugin._deepseek_rate_phase(self.plugin.datetime(2026, 8, 17, 9, 59, tzinfo=utc)),
+            ("peak", "☀️"),
+        )
+        self.assertEqual(
+            self.plugin._deepseek_rate_phase(self.plugin.datetime(2026, 8, 17, 10, 0, tzinfo=utc)),
+            ("off-peak", "🌙"),
+        )
+
+    def test_deepseek_rate_phase_off_peak_most_of_the_day(self) -> None:
+        utc = self.plugin.timezone.utc
+        for hour in (0, 5, 11, 12, 17, 23):
+            with self.subTest(hour=hour):
+                self.assertEqual(
+                    self.plugin._deepseek_rate_phase(
+                        self.plugin.datetime(2026, 8, 17, hour, 30, tzinfo=utc)
+                    ),
+                    ("off-peak", "🌙"),
+                )
+
+    def test_deepseek_rate_phase_treats_naive_datetime_as_utc(self) -> None:
+        naive = self.plugin.datetime(2026, 8, 17, 2, 0)
+        self.assertEqual(self.plugin._deepseek_rate_phase(naive), ("peak", "☀️"))
+
+    def test_deepseek_rate_phase_defaults_to_now_utc(self) -> None:
+        with patch.object(
+            self.plugin,
+            "_now_utc",
+            return_value=self.plugin.datetime(2026, 8, 17, 7, 30, tzinfo=self.plugin.timezone.utc),
+        ):
+            self.assertEqual(self.plugin._deepseek_rate_phase(), ("peak", "☀️"))
 
     def test_render_gemini_uses_ge_without_standalone_g(self) -> None:
         rendered = self.plugin._render_provider("gemini", {"key_valid": True, "probe": {"status": 200}}, False)
@@ -2926,23 +2992,27 @@ class HermesQuotaStatusTests(unittest.TestCase):
     def test_render_reads_provider_allowlist_from_snapshot_config(self) -> None:
         self._seed_all_provider_cache()
 
-        with patch.object(self.plugin, "_start_refresh_if_needed") as start_refresh:
+        with patch.object(self.plugin, "_start_refresh_if_needed") as start_refresh, patch.object(
+            self.plugin, "_deepseek_rate_phase", return_value=("off-peak", "🌙")
+        ):
             rendered = self.plugin.on_status_bar_render(
                 {"config": {"quota_status": {"providers": ["claude", "deepseek"]}}}
             )
 
         start_refresh.assert_called_once_with(("claude", "deepseek"))
-        self.assertEqual(rendered, "🟢 C:24% │ 🟢 D:$3.50")
+        self.assertEqual(rendered, "🟢 C:24% │ 🟢 D:$3.50🌙")
 
     def test_render_reads_provider_allowlist_from_render_context_kwargs(self) -> None:
         self._seed_all_provider_cache()
 
-        with patch.object(self.plugin, "_start_refresh_if_needed"):
+        with patch.object(self.plugin, "_start_refresh_if_needed"), patch.object(
+            self.plugin, "_deepseek_rate_phase", return_value=("off-peak", "🌙")
+        ):
             rendered = self.plugin.on_status_bar_render(
                 render_context={"config_snapshot": {"quota_status": {"providers": ["deepseek"]}}}
             )
 
-        self.assertEqual(rendered, "🟢 D:$3.50")
+        self.assertEqual(rendered, "🟢 D:$3.50🌙")
 
     def test_render_provider_allowlist_is_case_sensitive(self) -> None:
         self._seed_all_provider_cache()
@@ -2956,10 +3026,12 @@ class HermesQuotaStatusTests(unittest.TestCase):
     def test_render_without_configured_allowlist_preserves_available_provider_rendering(self) -> None:
         self._seed_all_provider_cache()
 
-        with patch.object(self.plugin, "_start_refresh_if_needed"):
+        with patch.object(self.plugin, "_start_refresh_if_needed"), patch.object(
+            self.plugin, "_deepseek_rate_phase", return_value=("off-peak", "🌙")
+        ):
             rendered = self.plugin.on_status_bar_render({"config": {}})
 
-        self.assertEqual(rendered, "🟢 C:24% │ 🟢 Cx:11% │ 🟢 Ge:OK │ 🟢 G:28% │ 🟢 D:$3.50")
+        self.assertEqual(rendered, "🟢 C:24% │ 🟢 Cx:11% │ 🟢 Ge:OK │ 🟢 G:28% │ 🟢 D:$3.50🌙")
 
     def test_acceptance_status_bar_contains_successful_glm_and_deepseek_segments(self) -> None:
         glm_fetcher = MagicMock(return_value={"session_pct": 28.0, "reset_iso": ""})
@@ -2980,13 +3052,15 @@ class HermesQuotaStatusTests(unittest.TestCase):
         ):
             self.plugin._refresh_cache(("glm", "deepseek"))
 
-        with patch.object(self.plugin, "_start_refresh_if_needed") as start_refresh:
+        with patch.object(self.plugin, "_start_refresh_if_needed") as start_refresh, patch.object(
+            self.plugin, "_deepseek_rate_phase", return_value=("off-peak", "🌙")
+        ):
             rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["glm", "deepseek"]}})
 
         glm_fetcher.assert_called_once_with()
         deepseek_fetcher.assert_called_once_with()
         start_refresh.assert_called_once_with(("glm", "deepseek"))
-        self.assertEqual(rendered, "🟢 G:28% │ 🟢 D:$3.50")
+        self.assertEqual(rendered, "🟢 G:28% │ 🟢 D:$3.50🌙")
 
     def test_acceptance_glm_missing_credentials_omits_glm_from_successful_status_output(self) -> None:
         glm_fetcher = MagicMock(return_value=None)
@@ -3007,12 +3081,14 @@ class HermesQuotaStatusTests(unittest.TestCase):
         ):
             self.plugin._refresh_cache(("glm", "deepseek"))
 
-        with patch.object(self.plugin, "_start_refresh_if_needed"):
+        with patch.object(self.plugin, "_start_refresh_if_needed"), patch.object(
+            self.plugin, "_deepseek_rate_phase", return_value=("off-peak", "🌙")
+        ):
             rendered = self.plugin.on_status_bar_render({"quota_status": {"providers": ["glm", "deepseek"]}})
 
         glm_fetcher.assert_called_once_with()
         deepseek_fetcher.assert_called_once_with()
-        self.assertEqual(rendered, "🟢 D:$3.50")
+        self.assertEqual(rendered, "🟢 D:$3.50🌙")
         self.assertNotIn(" G:", rendered)
 
     def test_acceptance_deepseek_missing_credentials_omits_deepseek_from_successful_status_output(self) -> None:
