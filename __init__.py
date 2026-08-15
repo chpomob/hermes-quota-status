@@ -124,8 +124,9 @@ CREDENTIAL_REQUIRED_OMIT_PROVIDERS: Final[tuple[ProviderName, ...]] = ("glm", "d
 # 16:00 UTC on 2026-08-16 (official pricing page). Peak windows are
 # 01:00-04:00 UTC and 06:00-10:00 UTC; every other hour is off-peak at
 # half the peak rate. Intervals are [start, end). Before the effective
-# date no phase applies (V4 was flat-priced), so the status bar shows
-# no phase icon until the scheduled card takes over.
+# date no phase applies (V4 was flat-priced); the segment still signals
+# the pre-state with a ∿ marker plus a countdown to the switch so the
+# status bar is never silent about DeepSeek billing.
 DEEPSEEK_PEAK_SCHEDULE_EFFECTIVE: Final[datetime] = datetime(
     2026, 8, 16, 16, 0, tzinfo=timezone.utc
 )
@@ -133,7 +134,7 @@ DEEPSEEK_PEAK_WINDOWS: Final[tuple[tuple[int, int], ...]] = ((1, 4), (6, 10))
 DEEPSEEK_PHASE_ICONS: Final[dict[str, str]] = {
     "peak": "☀️",
     "off-peak": "🌙",
-    "flat": "",
+    "flat": "∿",
 }
 
 logger = logging.getLogger(__name__)
@@ -1235,8 +1236,9 @@ def _deepseek_rate_phase(now: datetime | None = None) -> tuple[str, str]:
     phase is ``"peak"``, ``"off-peak"``, or ``"flat"``. Flat covers the
     period before the scheduled peak/off-peak card takes effect
     (2026-08-16 16:00 UTC), when V4 rates were flat and no phase
-    applied; it carries an empty icon so the status bar simply omits the
-    phase marker. Peak windows are [01:00, 04:00) and [06:00, 10:00)
+    applied; it carries the flat marker ``∿`` so the status bar still
+    signals the pre-state (the renderer appends a countdown to the
+    switch). Peak windows are [01:00, 04:00) and [06:00, 10:00)
     UTC; all other hours are off-peak at half the peak rate. A naive
     ``now`` is assumed to be UTC.
     """
@@ -1266,7 +1268,12 @@ def _render_deepseek_data(data: ProviderQuota | None) -> str:
     if not display:
         return f"🟡 {short}:?"
 
-    _, phase_icon = _deepseek_rate_phase()
+    phase, phase_icon = _deepseek_rate_phase()
+    if phase == "flat":
+        # Flat is a transient pre-state (until the scheduled peak/off-peak
+        # card takes effect): surface the countdown to the switch so the
+        # segment still signals live billing state.
+        phase_icon = f"∿{_fmt_reset(DEEPSEEK_PEAK_SCHEDULE_EFFECTIVE.isoformat())}"
     balance = _first_balance_number(data)
     is_available = data.get("is_available")
     if is_available is False or (balance is not None and balance <= 0.0):

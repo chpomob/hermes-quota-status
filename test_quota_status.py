@@ -2208,7 +2208,24 @@ class HermesQuotaStatusTests(unittest.TestCase):
         before_effective = self.plugin.datetime(
             2026, 8, 16, 15, 59, 59, tzinfo=self.plugin.timezone.utc
         )
-        self.assertEqual(self.plugin._deepseek_rate_phase(before_effective), ("flat", ""))
+        self.assertEqual(self.plugin._deepseek_rate_phase(before_effective), ("flat", "∿"))
+
+    def test_render_deepseek_flat_phase_shows_marker_and_countdown(self) -> None:
+        data = {
+            "is_available": True,
+            "currency": "USD",
+            "balance": 3.5,
+            "total_balance": 3.5,
+            "total_balance_display": "3.50",
+        }
+        with patch.object(
+            self.plugin,
+            "_now_utc",
+            return_value=self.plugin.datetime(2026, 8, 15, 20, 0, tzinfo=self.plugin.timezone.utc),
+        ), patch.object(self.plugin, "_deepseek_rate_phase", return_value=("flat", "∿")):
+            rendered = self.plugin._render_deepseek_data(data)
+        # 2026-08-15 20:00 UTC -> 2026-08-16 16:00 UTC = 20h0m until the switch.
+        self.assertEqual(rendered, "🟢 D:$3.50∿20h0m")
 
     def test_deepseek_rate_phase_applies_at_effective_instant(self) -> None:
         effective = self.plugin.datetime(2026, 8, 16, 16, 0, 0, tzinfo=self.plugin.timezone.utc)
@@ -3192,27 +3209,31 @@ class HermesQuotaStatusTests(unittest.TestCase):
     def test_render_width_61_does_not_trim(self) -> None:
         self._seed_wide_provider_cache()
 
-        with patch.object(self.plugin, "_start_refresh_if_needed"):
+        with patch.object(self.plugin, "_start_refresh_if_needed"), patch.object(
+            self.plugin, "_deepseek_rate_phase", return_value=("off-peak", "🌙")
+        ):
             rendered = self.plugin.on_status_bar_render({"terminal_width": 61})
 
         self.assertIsNotNone(rendered)
         self.assertGreater(self.plugin._display_width(rendered), 61)
         self.assertEqual(
             rendered,
-            "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28% │ 🟢 D:$3.50",
+            "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28% │ 🟢 D:$3.50🌙",
         )
 
     def test_render_width_above_60_does_not_apply_fixed_60_character_cap(self) -> None:
         self._seed_wide_provider_cache()
 
-        with patch.object(self.plugin, "_start_refresh_if_needed"):
+        with patch.object(self.plugin, "_start_refresh_if_needed"), patch.object(
+            self.plugin, "_deepseek_rate_phase", return_value=("off-peak", "🌙")
+        ):
             rendered = self.plugin.on_status_bar_render({"terminal_width": 80})
 
         self.assertIsNotNone(rendered)
         self.assertGreater(self.plugin._display_width(rendered), 80)
         self.assertEqual(
             rendered,
-            "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28% │ 🟢 D:$3.50",
+            "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28% │ 🟢 D:$3.50🌙",
         )
 
     def test_render_too_narrow_for_first_segment_returns_none(self) -> None:
@@ -3234,12 +3255,14 @@ class HermesQuotaStatusTests(unittest.TestCase):
     def test_render_missing_width_does_not_apply_60_character_cap(self) -> None:
         self._seed_wide_provider_cache()
 
-        with patch.object(self.plugin, "_start_refresh_if_needed"):
+        with patch.object(self.plugin, "_start_refresh_if_needed"), patch.object(
+            self.plugin, "_deepseek_rate_phase", return_value=("off-peak", "🌙")
+        ):
             rendered = self.plugin.on_status_bar_render({"config": {}})
 
         self.assertEqual(
             rendered,
-            "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28% │ 🟢 D:$3.50",
+            "🟡 C:5h:24% 7d:61% │ 🟡 Cx:P:22% S:63% │ 🟡 Ge:CREDITS 600/1500 │ 🟢 G:28% │ 🟢 D:$3.50🌙",
         )
         self.assertGreater(self.plugin._display_width(rendered), 60)
 
